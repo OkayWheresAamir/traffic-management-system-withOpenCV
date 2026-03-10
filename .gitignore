@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# video files
+*.mp4
+*.avi
+
+# datasets
+data/
