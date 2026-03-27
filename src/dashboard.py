@@ -298,7 +298,7 @@ def draw_traffic_animation(step_data, sim_t, mode, ambulance_pos=None):
         # ── Moving EW vehicles through / after intersection ──
         # A few vehicles moving east on the open road
         for k in range(3):
-            base_x = (sim_t * 55 + k * 190 + {"J0": 0, "J1": 100, "J2": 200}[j]) % (CW + 80) - 40
+            base_x = (sim_t * 18 + k * 190 + {"J0": 0, "J1": 100, "J2": 200}[j]) % (CW + 80) - 40
             # Only show if they're in a plausible gap (not behind a queue)
             in_gap = True
             for j2, jx2 in JX.items():
@@ -312,7 +312,7 @@ def draw_traffic_animation(step_data, sim_t, mode, ambulance_pos=None):
 
         # ── Westbound vehicles (moving left, simpler) ──
         for k in range(2):
-            base_x = CW - (sim_t * 40 + k * 220 + {"J0": 50, "J1": 150, "J2": 250}[j]) % (CW + 80) + 40
+            base_x = CW - (sim_t * 14 + k * 220 + {"J0": 50, "J1": 150, "J2": 250}[j]) % (CW + 80) + 40
             if 0 < base_x < CW:
                 veh_x.append(base_x)
                 veh_y.append(ROAD_CY + 7)
@@ -331,7 +331,7 @@ def draw_traffic_animation(step_data, sim_t, mode, ambulance_pos=None):
 
         # ── Moving NS vehicles (northbound from bottom) ──
         for k in range(2):
-            base_y = CH - (sim_t * 35 + k * 130) % (CH + 60) + 30
+            base_y = CH - (sim_t * 12 + k * 130) % (CH + 60) + 30
             if ROAD_CY + ROAD_HALF < base_y < CH:
                 veh_x.append(jx - 7)
                 veh_y.append(base_y)
@@ -443,7 +443,7 @@ def draw_traffic_animation(step_data, sim_t, mode, ambulance_pos=None):
         paper_bgcolor="#0f1117",
         plot_bgcolor="#141a12",
         xaxis=dict(visible=False, range=[0, CW]),
-        yaxis=dict(visible=False, range=[0, CH], scaleanchor="x", scaleratio=1),
+        yaxis=dict(visible=False, range=[0, CH]),
         height=300,
         margin=dict(l=0, r=0, t=0, b=0),
         legend=dict(orientation="h", y=-0.12, bgcolor="rgba(0,0,0,0)",
@@ -506,9 +506,11 @@ def chart_ambulance_timeline(nopcs_sum, pcs_sum):
                          textposition="inside", insidetextanchor="start"))
     fig.add_vline(x=ne, line_dash="dash", line_color=COLORS["ambulance"],
                   annotation_text="🚑 Dispatched", annotation_position="top right")
-    fig.update_layout(**DARK_LAYOUT, title="Ambulance Corridor Travel Time",
+    amb_layout = {**DARK_LAYOUT, "legend": dict(orientation="h", y=-0.4,
+                                               bgcolor="rgba(0,0,0,0)")}
+    fig.update_layout(**amb_layout, title="Ambulance Corridor Travel Time",
                       xaxis_title="Simulation Time (s)", barmode="overlay",
-                      height=220, legend=dict(orientation="h", y=-0.4))
+                      height=220)
     return fig
 
 
