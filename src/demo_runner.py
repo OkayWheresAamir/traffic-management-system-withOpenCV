@@ -240,7 +240,7 @@ def simulate_fixed(arrivals, duration):
         per_j = {}
         for j in JUNCTIONS:
             js = junctions[j]
-            per_j[j] = {"ns": round(js.queue_ns), "ew": round(js.queue_ew)}
+            per_j[j] = {"ns": round(js.queue_ns), "ew": round(js.queue_ew), "phase": js.phase}
         steps.append({"t": t, "total_halted": round(total_halted), "per_j": per_j})
 
     return steps
@@ -345,7 +345,7 @@ def simulate_adaptive(arrivals, duration):
         per_j = {}
         for j in JUNCTIONS:
             js = junctions[j]
-            per_j[j] = {"ns": round(js.queue_ns), "ew": round(js.queue_ew)}
+            per_j[j] = {"ns": round(js.queue_ns), "ew": round(js.queue_ew), "phase": js.phase}
         steps.append({"t": t, "total_halted": round(total_halted), "per_j": per_j})
 
     return steps
@@ -557,8 +557,13 @@ def simulate_emergency(arrivals, duration, pcs_enabled):
         per_j = {}
         for j in JUNCTIONS:
             js = junctions[j]
-            per_j[j] = {"ns": round(js.queue_ns), "ew": round(js.queue_ew)}
-        steps.append({"t": t, "total_halted": round(total_halted), "per_j": per_j})
+            per_j[j] = {"ns": round(js.queue_ns), "ew": round(js.queue_ew), "phase": js.phase}
+        amb_data = {
+            "pos_m": round(amb_pos_m, 1),
+            "active": bool(amb_dispatched and not amb_done),
+            "speed": round(amb_speed, 1),
+        }
+        steps.append({"t": t, "total_halted": round(total_halted), "per_j": per_j, "amb": amb_data})
 
     # Compute ambulance travel time
     amb_travel = (amb_exit_t - amb_enter_t) if (amb_enter_t is not None and amb_exit_t is not None) else None

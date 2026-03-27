@@ -1,14 +1,17 @@
 """
-FlowSense — Hackathon Demo Dashboard (v2)
+FlowSense — Hackathon Demo Dashboard (v3)
 =========================================
-Single-page layout with live traffic animation, signal states, and KPI comparison.
+Data flow:
+  demo_runner.py  →  results/*.json  →  dashboard (replay + live metrics)
 
-Usage:
-    streamlit run src/dashboard.py
+Each step in results/*.json now carries:
+  per_j[j] = {ew, ns, phase}          ← real signal phase from simulation
+  amb       = {pos_m, active, speed}   ← ambulance position (emergency only)
 
-Works in two modes:
-  • LIVE mode  — loads simulation results from results/ directory (video-derived)
-  • FALLBACK   — uses hardcoded realistic demo data
+Dashboard maintains history buffers in session_state so charts grow in
+real-time as the simulation steps forward.
+
+Usage:  streamlit run src/dashboard.py
 """
 
 import json
@@ -31,6 +34,7 @@ st.set_page_config(
 )
 
 RESULTS_DIR = Path("results")
+SIM_LIMIT   = 120   # demo runs for 120 simulation seconds
 
 # ──────────────────────────────────────────────────────────────────────────────
 # STYLING
@@ -49,15 +53,6 @@ st.markdown("""
   }
   .metric-val  { font-size: 2.2rem; font-weight: 700; color: #58a6ff; }
   .metric-label{ font-size: 0.82rem; color: #8b949e; margin-top: 4px; }
-  .mode-btn-active {
-    background: #1f4028; border: 1.5px solid #56d364;
-    border-radius: 8px; padding: 8px 12px; color: #56d364;
-    font-weight: 700; text-align: center; cursor: pointer;
-  }
-  .mode-btn { background: #161b22; border: 1px solid #30363d;
-    border-radius: 8px; padding: 8px 12px; color: #8b949e;
-    font-weight: 600; text-align: center; cursor: pointer;
-  }
   .sig-green { color: #22c55e; font-size: 1.2rem; font-weight: 700; }
   .sig-red   { color: #ef4444; font-size: 1.2rem; font-weight: 700; }
   .sig-yellow{ color: #eab308; font-size: 1.2rem; font-weight: 700; }
@@ -93,6 +88,29 @@ MODES = {
 
 JUNCTIONS = ["J0", "J1", "J2"]
 
+# Signal phase → (EW signal color, NS signal color)
+PHASE_SIG = {
+    "EW_GREEN":  ("#22c55e", "#ef4444"),
+    "EW_YELLOW": ("#eab308", "#ef4444"),
+    "NS_GREEN":  ("#ef4444", "#22c55e"),
+    "NS_YELLOW": ("#ef4444", "#eab308"),
+    "ALL_RED":   ("#ef4444", "#ef4444"),
+}
+
+# Ambulance corridor geometry (mirrors demo_runner.py)
+AMB_ENTRY_OFFSET_M = 100.0
+AMB_JUNCTION_SPACING_M = 500.0
+# Canvas X positions for junctions
+JX = {"J0": 180, "J1": 430, "J2": 680}
+# Map pos_m → canvas X:
+#   J0 at entry+100m → canvas 180; J2 at entry+1100m → canvas 680
+AMB_POS_SCALE = (JX["J2"] - JX["J0"]) / (AMB_ENTRY_OFFSET_M + 2 * AMB_JUNCTION_SPACING_M - AMB_ENTRY_OFFSET_M)
+# i.e. (680-180) / 1000 = 0.5 px/m
+
+def amb_pos_to_canvas_x(pos_m):
+    """Convert ambulance pos_m to canvas pixel X."""
+    return JX["J0"] + (pos_m - AMB_ENTRY_OFFSET_M) * AMB_POS_SCALE
+
 # ──────────────────────────────────────────────────────────────────────────────
 # DATA LOADING
 # ──────────────────────────────────────────────────────────────────────────────
@@ -114,7 +132,7 @@ def load_results():
 
 def make_fallback():
     rng = np.random.RandomState(0)
-    T = 600
+    T = SIM_LIMIT
     t = np.arange(T)
     base_h  = np.clip(3 + 22 * (1 - np.exp(-t / 80)) + rng.normal(0, 2, T), 0, None)
     adapt_h = np.clip(2 + 10 * (1 - np.exp(-t / 40)) + 3 * np.sin(t / 30) + rng.normal(0, 1.5, T), 0, None)
@@ -125,31 +143,37 @@ def make_fallback():
     base_h  = smooth(base_h.tolist())
     adapt_h = smooth(adapt_h.tolist())
 
-    def make_per_j(halted):
+    def make_per_j(halted, t_):
         per_j = {}
+        phases = ["EW_GREEN", "NS_GREEN", "EW_YELLOW"]
         for i, j in enumerate(JUNCTIONS):
             frac = [0.35, 0.4, 0.25][i]
-            per_j[j] = {"ns": round(h * frac * 0.5), "ew": round(h * frac * 0.5)}
+            cycle = 90
+            offset = {"J0": 0, "J1": 10, "J2": 20}[j]
+            ph = "EW_GREEN" if ((t_ + offset) % cycle) < 43 else "NS_GREEN"
+            per_j[j] = {"ns": round(halted * frac * 0.5),
+                        "ew": round(halted * frac * 0.5),
+                        "phase": ph}
         return per_j
 
     return {
         "baseline": {
             "tag": "baseline",
-            "steps": [{"t": t_, "total_halted": round(h), "per_j": make_per_j(h)}
+            "steps": [{"t": t_, "total_halted": round(h), "per_j": make_per_j(h, t_)}
                       for t_, h in enumerate(base_h)],
             "summary": {"avg_halted": round(sum(base_h)/len(base_h), 1),
                         "peak_halted": round(max(base_h), 1)},
         },
         "adaptive": {
             "tag": "adaptive",
-            "steps": [{"t": t_, "total_halted": round(h), "per_j": make_per_j(h)}
+            "steps": [{"t": t_, "total_halted": round(h), "per_j": make_per_j(h, t_)}
                       for t_, h in enumerate(adapt_h)],
             "summary": {"avg_halted": round(sum(adapt_h)/len(adapt_h), 1),
                         "peak_halted": round(max(adapt_h), 1)},
         },
         "emergency_nopcs": {
             "tag": "emergency_nopcs",
-            "steps": [{"t": t_, "total_halted": round(h), "per_j": make_per_j(h)}
+            "steps": [{"t": t_, "total_halted": round(h), "per_j": make_per_j(h, t_)}
                       for t_, h in enumerate(adapt_h)],
             "summary": {"avg_halted": round(sum(adapt_h)/len(adapt_h), 1),
                         "peak_halted": round(max(adapt_h), 1),
@@ -158,7 +182,8 @@ def make_fallback():
         },
         "emergency_pcs": {
             "tag": "emergency_pcs",
-            "steps": [{"t": t_, "total_halted": round(h), "per_j": make_per_j(h)}
+            "steps": [{"t": t_, "total_halted": round(h), "per_j": make_per_j(h, t_),
+                       "amb": {"pos_m": max(0, (t_ - 120) * 14.0), "active": bool(120 <= t_ <= 209), "speed": 14.0}}
                       for t_, h in enumerate(adapt_h)],
             "summary": {"avg_halted": round(sum(adapt_h)/len(adapt_h), 1),
                         "peak_halted": round(max(adapt_h), 1),
@@ -169,88 +194,63 @@ def make_fallback():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SIGNAL PHASE INFERENCE
-# (derives approximate EW/NS green from queue data + mode + time)
+# PHASE READING  (reads real phase from step data, no inference)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def infer_signal_phases(step_data, sim_t, mode):
-    """
-    Return dict: {junction: "EW_GREEN" or "NS_GREEN"}
-    Uses queue data and mode to estimate current signal phase.
-    """
-    per_j = step_data.get("per_j", {})
-    phases = {}
-    for j in JUNCTIONS:
-        q_ew = per_j.get(j, {}).get("ew", 0)
-        q_ns = per_j.get(j, {}).get("ns", 0)
-        if mode == "fixed":
-            cycle = 90
-            offset = {"J0": 0, "J1": 10, "J2": 20}[j]  # slight offset per junction
-            phase_t = (sim_t + offset) % cycle
-            phases[j] = "EW_GREEN" if phase_t < 43 else "NS_GREEN"
-        elif mode == "emergency":
-            # Emergency: EW stays green more often near ambulance window
-            if 120 <= sim_t <= 220:
-                phases[j] = "EW_GREEN"
-            else:
-                phases[j] = "EW_GREEN" if q_ew >= q_ns else "NS_GREEN"
-        else:
-            # Adaptive: green for whichever approach has higher queue
-            phases[j] = "EW_GREEN" if q_ew >= q_ns else "NS_GREEN"
-    return phases
+def get_phases_from_step(sd):
+    """Return {junction: phase_string} read directly from step data."""
+    per_j = sd.get("per_j", {})
+    return {j: per_j.get(j, {}).get("phase", "EW_GREEN") for j in JUNCTIONS}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # TRAFFIC ANIMATION
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Canvas layout constants
-CW, CH = 860, 300
-ROAD_CY = 150          # EW road center y
-ROAD_HALF = 16         # EW road half-height
-NS_ROAD_HALF = 16      # NS road half-width
-JX = {"J0": 180, "J1": 430, "J2": 680}  # junction x positions
-STOP_OFFSET = 28       # stop line distance from center
-VEH_SPACING = 20       # spacing between queued vehicles
-VEH_SIZE = 8           # vehicle dot size
+CW, CH   = 860, 300
+ROAD_CY  = 150
+ROAD_HALF = 16
+NS_ROAD_HALF = 16
+STOP_OFFSET  = 28
+VEH_SPACING  = 20
+VEH_SIZE     = 8
 
 
-def draw_traffic_animation(step_data, sim_t, mode, ambulance_pos=None):
+def draw_traffic_animation(step_data, sim_t, mode):
     """
-    Plotly-based traffic animation. Returns a go.Figure.
-    Vehicles accumulate when red, discharge when green.
+    Plotly traffic animation.
+
+    Vehicles:
+      - Queued vehicles: stacked behind stop line; red=halted, green=discharging
+      - Moving vehicles: position derived from sim_t (wraps around)
+
+    Signal lights: color taken from real phase in step_data (green/yellow/red).
+
+    Ambulance: position from step_data["amb"]["pos_m"] when active.
     """
-    per_j = step_data.get("per_j", {})
-    phases = infer_signal_phases(step_data, sim_t, mode)
+    per_j  = step_data.get("per_j", {})
+    phases = get_phases_from_step(step_data)       # real phases, not inferred
 
     fig = go.Figure()
 
-    # ── Background ──
+    # ── Background / roads ──────────────────────────────────────────────────
     fig.add_shape(type="rect", x0=0, x1=CW, y0=0, y1=CH,
                   fillcolor="#141a12", line_width=0, layer="below")
-
-    # ── EW road ──
     fig.add_shape(type="rect", x0=0, x1=CW,
                   y0=ROAD_CY - ROAD_HALF, y1=ROAD_CY + ROAD_HALF,
                   fillcolor="#2a2a30", line_width=0)
-
-    # EW center dashes
     for x in range(10, CW, 32):
         fig.add_shape(type="line", x0=x, x1=x + 18, y0=ROAD_CY, y1=ROAD_CY,
                       line=dict(color="#444", width=1.5, dash="dash"))
 
-    # ── NS roads and intersections ──
     for j, jx in JX.items():
-        # NS road surface
         fig.add_shape(type="rect",
                       x0=jx - NS_ROAD_HALF, x1=jx + NS_ROAD_HALF, y0=0, y1=CH,
                       fillcolor="#2a2a30", line_width=0)
-        # Intersection box
         fig.add_shape(type="rect",
                       x0=jx - NS_ROAD_HALF, x1=jx + NS_ROAD_HALF,
                       y0=ROAD_CY - ROAD_HALF, y1=ROAD_CY + ROAD_HALF,
                       fillcolor="#222228", line_width=0)
-        # NS road center dashes
         for y in range(10, ROAD_CY - ROAD_HALF, 24):
             fig.add_shape(type="line", x0=jx, x1=jx, y0=y, y1=y + 14,
                           line=dict(color="#444", width=1, dash="dash"))
@@ -258,137 +258,119 @@ def draw_traffic_animation(step_data, sim_t, mode, ambulance_pos=None):
             fig.add_shape(type="line", x0=jx, x1=jx, y0=y, y1=y + 14,
                           line=dict(color="#444", width=1, dash="dash"))
 
-    # ── Stop lines ──
+    # Stop lines
     for j, jx in JX.items():
-        # Eastbound stop line
         fig.add_shape(type="line",
                       x0=jx - STOP_OFFSET, x1=jx - STOP_OFFSET,
                       y0=ROAD_CY - ROAD_HALF, y1=ROAD_CY,
                       line=dict(color="#666", width=2))
-        # Westbound stop line
         fig.add_shape(type="line",
                       x0=jx + STOP_OFFSET, x1=jx + STOP_OFFSET,
                       y0=ROAD_CY, y1=ROAD_CY + ROAD_HALF,
                       line=dict(color="#666", width=2))
-        # NS southbound stop line
         fig.add_shape(type="line",
                       x0=jx, x1=jx + NS_ROAD_HALF,
                       y0=ROAD_CY - STOP_OFFSET, y1=ROAD_CY - STOP_OFFSET,
                       line=dict(color="#666", width=2))
 
-    # ── Collect vehicle positions ──
+    # ── Vehicles ────────────────────────────────────────────────────────────
     veh_x, veh_y, veh_colors, veh_symbols = [], [], [], []
 
     for j, jx in JX.items():
-        phase = phases[j]
+        phase    = phases[j]
         ew_green = (phase == "EW_GREEN")
+        ns_green = (phase == "NS_GREEN")
+        # Yellow = transitioning; treat as red for queueing but show some discharge
+        ew_discharging = phase in ("EW_GREEN",)
+        ns_discharging = phase in ("NS_GREEN",)
+
         q_ew = int(min(per_j.get(j, {}).get("ew", 0), 14))
         q_ns = int(min(per_j.get(j, {}).get("ns", 0), 10))
 
-        # ── Queued EW vehicles (eastbound, before stop line) ──
+        # ── Queued EW (eastbound, waiting before stop line) ──
         stop_x = jx - STOP_OFFSET - 2
+        lo_x   = JX["J0"] - 140 if j == "J0" else 5
         for k in range(q_ew):
             vx = stop_x - k * VEH_SPACING
-            if vx > (JX.get("J0", 0) - 150 if j == "J0" else 0):
-                veh_x.append(vx)
-                veh_y.append(ROAD_CY - 7)
-                veh_colors.append("#c85050" if not ew_green else "#50dca0")
-                veh_symbols.append("square")
+            if vx > lo_x:
+                color = "#50dca0" if ew_discharging else "#c85050"
+                veh_x.append(vx);  veh_y.append(ROAD_CY - 7)
+                veh_colors.append(color);  veh_symbols.append("square")
 
-        # ── Moving EW vehicles through / after intersection ──
-        # A few vehicles moving east on the open road
+        # ── Moving EW vehicles (eastbound, open road) ──
         for k in range(3):
             base_x = (sim_t * 18 + k * 190 + {"J0": 0, "J1": 100, "J2": 200}[j]) % (CW + 80) - 40
-            # Only show if they're in a plausible gap (not behind a queue)
-            in_gap = True
-            for j2, jx2 in JX.items():
-                if abs(base_x - (jx2 - STOP_OFFSET - 5)) < 50 and not ew_green:
-                    in_gap = False
-            if in_gap and 0 < base_x < CW:
-                veh_x.append(base_x)
-                veh_y.append(ROAD_CY - 7)
-                veh_colors.append("#50dca0")
-                veh_symbols.append("square")
+            blocked = any(
+                abs(base_x - (jx2 - STOP_OFFSET - 5)) < 50 and not (phases[j2] == "EW_GREEN")
+                for j2, jx2 in JX.items()
+            )
+            if not blocked and 0 < base_x < CW:
+                veh_x.append(base_x);  veh_y.append(ROAD_CY - 7)
+                veh_colors.append("#50dca0");  veh_symbols.append("square")
 
-        # ── Westbound vehicles (moving left, simpler) ──
+        # ── Westbound vehicles ──
         for k in range(2):
             base_x = CW - (sim_t * 14 + k * 220 + {"J0": 50, "J1": 150, "J2": 250}[j]) % (CW + 80) + 40
             if 0 < base_x < CW:
-                veh_x.append(base_x)
-                veh_y.append(ROAD_CY + 7)
-                veh_colors.append("#50dca0")
-                veh_symbols.append("square")
+                veh_x.append(base_x);  veh_y.append(ROAD_CY + 7)
+                veh_colors.append("#50dca0");  veh_symbols.append("square")
 
-        # ── Queued NS vehicles (southbound, above intersection) ──
+        # ── Queued NS (southbound, above intersection) ──
         stop_y = ROAD_CY - STOP_OFFSET - 2
         for k in range(q_ns):
             vy = stop_y - k * VEH_SPACING
             if vy > 5:
-                veh_x.append(jx + 7)
-                veh_y.append(vy)
-                veh_colors.append("#c85050" if ew_green else "#50dca0")
-                veh_symbols.append("square")
+                color = "#50dca0" if ns_discharging else "#c85050"
+                veh_x.append(jx + 7);  veh_y.append(vy)
+                veh_colors.append(color);  veh_symbols.append("square")
 
         # ── Moving NS vehicles (northbound from bottom) ──
         for k in range(2):
             base_y = CH - (sim_t * 12 + k * 130) % (CH + 60) + 30
             if ROAD_CY + ROAD_HALF < base_y < CH:
-                veh_x.append(jx - 7)
-                veh_y.append(base_y)
-                veh_colors.append("#50dca0")
-                veh_symbols.append("square")
+                veh_x.append(jx - 7);  veh_y.append(base_y)
+                veh_colors.append("#50dca0");  veh_symbols.append("square")
 
-    # ── Ambulance (emergency mode) ──
-    if mode == "emergency" and 120 <= sim_t <= 220:
-        amb_x = (sim_t - 120) * (CW / 100)  # travels full width over ~100s
-        amb_x = min(amb_x, CW + 20)
+    # ── Ambulance (reads real pos_m from step data) ──────────────────────────
+    amb = step_data.get("amb", {})
+    if amb.get("active"):
+        amb_x = amb_pos_to_canvas_x(amb.get("pos_m", 0))
         if -20 < amb_x < CW + 20:
             flash = (sim_t % 2 == 0)
-            veh_x.append(amb_x)
-            veh_y.append(ROAD_CY - 7)
+            veh_x.append(amb_x);  veh_y.append(ROAD_CY - 7)
             veh_colors.append("#ef4444" if flash else "#ffffff")
             veh_symbols.append("diamond")
 
-    # ── Draw all vehicles ──
     if veh_x:
         fig.add_trace(go.Scatter(
-            x=veh_x, y=veh_y,
-            mode="markers",
+            x=veh_x, y=veh_y, mode="markers",
             marker=dict(color=veh_colors, size=VEH_SIZE, symbol=veh_symbols,
                         line=dict(color="#000", width=0.5)),
-            showlegend=False,
-            hoverinfo="skip",
+            showlegend=False, hoverinfo="skip",
         ))
 
-    # ── Signal lights ──
+    # ── Signal lights (real phase colors) ────────────────────────────────────
     sig_x, sig_y, sig_col = [], [], []
     for j, jx in JX.items():
-        phase = phases[j]
-        ew_col = "#22c55e" if phase == "EW_GREEN" else "#ef4444"
-        ns_col = "#22c55e" if phase == "NS_GREEN" else "#ef4444"
-        # EW signal (top-left of intersection)
-        sig_x.append(jx - STOP_OFFSET - 8)
-        sig_y.append(ROAD_CY - ROAD_HALF - 8)
-        sig_col.append(ew_col)
-        # NS signal (right side, above road)
-        sig_x.append(jx + NS_ROAD_HALF + 8)
-        sig_y.append(ROAD_CY - STOP_OFFSET - 8)
-        sig_col.append(ns_col)
+        phase      = phases[j]
+        ew_c, ns_c = PHASE_SIG.get(phase, ("#ef4444", "#ef4444"))
+        sig_x.append(jx - STOP_OFFSET - 8);  sig_y.append(ROAD_CY - ROAD_HALF - 8)
+        sig_col.append(ew_c)
+        sig_x.append(jx + NS_ROAD_HALF + 8);  sig_y.append(ROAD_CY - STOP_OFFSET - 8)
+        sig_col.append(ns_c)
 
     fig.add_trace(go.Scatter(
-        x=sig_x, y=sig_y,
-        mode="markers",
+        x=sig_x, y=sig_y, mode="markers",
         marker=dict(color=sig_col, size=11, symbol="circle",
                     line=dict(color="#000000", width=1.5)),
-        showlegend=False,
-        hoverinfo="skip",
+        showlegend=False, hoverinfo="skip",
     ))
 
-    # ── PCS reservation highlight (emergency mode, ambulance ahead) ──
-    if mode == "emergency" and 115 <= sim_t <= 220:
-        amb_x_now = (sim_t - 120) * (CW / 100)
+    # ── PCS reservation highlight ─────────────────────────────────────────────
+    if amb.get("active"):
+        amb_x_now = amb_pos_to_canvas_x(amb.get("pos_m", 0))
         for j, jx in JX.items():
-            if abs(jx - amb_x_now) < 250:
+            if abs(jx - amb_x_now) < 200:
                 fig.add_shape(type="rect",
                               x0=jx - NS_ROAD_HALF - 4, x1=jx + NS_ROAD_HALF + 4,
                               y0=ROAD_CY - ROAD_HALF - 4, y1=ROAD_CY + ROAD_HALF + 4,
@@ -398,12 +380,12 @@ def draw_traffic_animation(step_data, sim_t, mode, ambulance_pos=None):
                                    text="PCS", showarrow=False,
                                    font=dict(color="#f59e0b", size=9, family="monospace"))
 
-    # ── Junction labels ──
+    # ── Junction labels ───────────────────────────────────────────────────────
     for j, jx in JX.items():
         fig.add_annotation(x=jx, y=10, text=j, showarrow=False,
                            font=dict(color="#556", size=11, family="monospace"))
 
-    # ── Time and mode overlay ──
+    # ── Overlay: time + queue count ───────────────────────────────────────────
     fig.add_annotation(x=10, y=CH - 10, text=f"t = {sim_t}s",
                        showarrow=False, xanchor="left",
                        font=dict(color="#667", size=11, family="monospace"))
@@ -412,32 +394,22 @@ def draw_traffic_animation(step_data, sim_t, mode, ambulance_pos=None):
                        showarrow=False, xanchor="left",
                        font=dict(color="#667", size=11, family="monospace"))
 
-    if mode == "emergency" and 120 <= sim_t <= 220:
+    if amb.get("active"):
         fig.add_annotation(x=CW / 2, y=CH - 10, text="⚠ EMERGENCY VEHICLE ACTIVE",
                            showarrow=False,
                            font=dict(color="#ef4444", size=12, family="monospace"))
 
-    # ── Legend ──
-    fig.add_trace(go.Scatter(
-        x=[None], y=[None], mode="markers",
-        marker=dict(color="#50dca0", size=8, symbol="square"),
-        name="Moving", showlegend=True,
-    ))
-    fig.add_trace(go.Scatter(
-        x=[None], y=[None], mode="markers",
-        marker=dict(color="#c85050", size=8, symbol="square"),
-        name="Queued / Stopped", showlegend=True,
-    ))
-    fig.add_trace(go.Scatter(
-        x=[None], y=[None], mode="markers",
-        marker=dict(color="#22c55e", size=9, symbol="circle"),
-        name="Signal Green", showlegend=True,
-    ))
-    fig.add_trace(go.Scatter(
-        x=[None], y=[None], mode="markers",
-        marker=dict(color="#ef4444", size=9, symbol="circle"),
-        name="Signal Red", showlegend=True,
-    ))
+    # ── Legend traces ─────────────────────────────────────────────────────────
+    for name, col, sym in [
+        ("Moving", "#50dca0", "square"),
+        ("Queued / Stopped", "#c85050", "square"),
+        ("Signal Green", "#22c55e", "circle"),
+        ("Signal Yellow", "#eab308", "circle"),
+        ("Signal Red", "#ef4444", "circle"),
+    ]:
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers",
+                                 marker=dict(color=col, size=8, symbol=sym),
+                                 name=name, showlegend=True))
 
     fig.update_layout(
         paper_bgcolor="#0f1117",
@@ -456,21 +428,34 @@ def draw_traffic_animation(step_data, sim_t, mode, ambulance_pos=None):
 # CHART HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
 
-def chart_queue_comparison(base_steps, adapt_steps):
-    t_b = [s["t"] for s in base_steps]
-    h_b = [s["total_halted"] for s in base_steps]
-    t_a = [s["t"] for s in adapt_steps]
-    h_a = [s["total_halted"] for s in adapt_steps]
+def chart_queue_live(base_steps, adapt_steps, cur_t):
+    """
+    Side-by-side fixed vs adaptive queue chart, growing as simulation progresses.
+    Both lines are sliced to [0, cur_t] so the chart builds up in real-time.
+    """
+    base_sub  = [s for s in base_steps  if s["t"] <= cur_t]
+    adapt_sub = [s for s in adapt_steps if s["t"] <= cur_t]
+    if not base_sub:
+        # Empty placeholder if simulation hasn't started yet
+        fig = go.Figure()
+        fig.update_layout(**DARK_LAYOUT, title="Halted Vehicles (Live)", height=260)
+        return fig
+
+    t_b = [s["t"] for s in base_sub];   h_b = [s["total_halted"] for s in base_sub]
+    t_a = [s["t"] for s in adapt_sub];  h_a = [s["total_halted"] for s in adapt_sub]
+
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=t_b, y=h_b, name="Fixed-Time (Baseline)",
                              line=dict(color=COLORS["baseline"], width=2.5)))
     fig.add_trace(go.Scatter(x=t_a, y=h_a, name="FlowSense Adaptive",
                              line=dict(color=COLORS["adaptive"], width=2.5),
                              fill="tozeroy", fillcolor="rgba(88,166,255,0.07)"))
-    fig.update_layout(**DARK_LAYOUT,
-                      title="Halted Vehicles Over Time",
+    # Fix x-range so the chart doesn't rescale each frame
+    dl = {**DARK_LAYOUT,
+          "xaxis": {**DARK_LAYOUT["xaxis"], "range": [0, SIM_LIMIT]}}
+    fig.update_layout(**dl, title="Halted Vehicles (Live)",
                       xaxis_title="Sim Time (s)", yaxis_title="Halted Vehicles",
-                      height=280)
+                      height=260)
     return fig
 
 
@@ -482,7 +467,7 @@ def chart_avg_bar(summaries):
                            text=[f"{v:.1f}" for v in values],
                            textposition="outside",
                            textfont=dict(color="#e6edf3")))
-    fig.update_layout(**DARK_LAYOUT, title="Avg. Halted Vehicles",
+    fig.update_layout(**DARK_LAYOUT, title="Avg. Halted Vehicles (full run)",
                       height=260, showlegend=False)
     return fig
 
@@ -507,30 +492,38 @@ def chart_ambulance_timeline(nopcs_sum, pcs_sum):
     fig.add_vline(x=ne, line_dash="dash", line_color=COLORS["ambulance"],
                   annotation_text="🚑 Dispatched", annotation_position="top right")
     amb_layout = {**DARK_LAYOUT, "legend": dict(orientation="h", y=-0.4,
-                                               bgcolor="rgba(0,0,0,0)")}
+                                                bgcolor="rgba(0,0,0,0)")}
     fig.update_layout(**amb_layout, title="Ambulance Corridor Travel Time",
                       xaxis_title="Simulation Time (s)", barmode="overlay",
                       height=220)
     return fig
 
 
-def chart_per_junction(steps):
-    t = [s["t"] for s in steps]
-    colors = ["#58a6ff", "#56d364", "#f0a500"]
-    fig = go.Figure()
+def chart_per_junction_live(steps, cur_t):
+    """Per-junction queue over time, growing to cur_t."""
+    sub   = [s for s in steps if s["t"] <= cur_t]
+    if not sub:
+        fig = go.Figure()
+        fig.update_layout(**DARK_LAYOUT, title="Queue per Intersection", height=220)
+        return fig
+    t     = [s["t"] for s in sub]
+    colors= ["#58a6ff", "#56d364", "#f0a500"]
+    fig   = go.Figure()
     for i, j in enumerate(JUNCTIONS):
-        total = [s.get("per_j", {}).get(j, {}).get("ew", 0)
-                 + s.get("per_j", {}).get(j, {}).get("ns", 0) for s in steps]
-        total = pd.Series(total).rolling(5, min_periods=1, center=True).mean().tolist()
-        fig.add_trace(go.Scatter(x=t, y=total, name=j,
+        vals = [s.get("per_j", {}).get(j, {}).get("ew", 0)
+                + s.get("per_j", {}).get(j, {}).get("ns", 0) for s in sub]
+        vals = pd.Series(vals).rolling(5, min_periods=1, center=True).mean().tolist()
+        fig.add_trace(go.Scatter(x=t, y=vals, name=j,
                                  line=dict(color=colors[i], width=2)))
-    fig.update_layout(**DARK_LAYOUT, title="Queue per Intersection (Adaptive)",
-                      xaxis_title="Time (s)", yaxis_title="Halted", height=240)
+    dl = {**DARK_LAYOUT,
+          "xaxis": {**DARK_LAYOUT["xaxis"], "range": [0, SIM_LIMIT]}}
+    fig.update_layout(**dl, title="Queue per Intersection (Adaptive)",
+                      xaxis_title="Time (s)", yaxis_title="Halted", height=220)
     return fig
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ARCHITECTURE (HTML — no Plotly, no crash)
+# ARCHITECTURE
 # ──────────────────────────────────────────────────────────────────────────────
 
 def render_architecture_html():
@@ -565,18 +558,59 @@ def render_architecture_html():
 # MAIN APP
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _reset_history():
+    st.session_state.hist_t      = []
+    st.session_state.hist_halted = []
+
+
 def main():
     # ── Session state init ──────────────────────────────────────────────────
-    if "step" not in st.session_state:
-        st.session_state.step = 0
-    if "running" not in st.session_state:
-        st.session_state.running = True
-    if "ui_mode" not in st.session_state:
-        st.session_state.ui_mode = "adaptive"
-    if "sim_speed" not in st.session_state:
-        st.session_state.sim_speed = 3  # steps per rerun
+    defaults = {
+        "step":       0,
+        "running":    True,
+        "ui_mode":    "adaptive",
+        "sim_speed":  3,
+        "hist_t":     [],
+        "hist_halted":[],
+        "hist_mode":  None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
     data, is_live = load_results()
+
+    # ── Pre-compute current frame (before any layout renders) ────────────────
+    ui_mode   = st.session_state.ui_mode
+    rkey      = MODES[ui_mode]["result_key"]
+    steps     = data[rkey]["steps"][:SIM_LIMIT]
+    cur_step  = min(st.session_state.step, len(steps) - 1)
+    sd        = steps[cur_step]
+
+    # History: reset on mode change, append current step
+    if st.session_state.hist_mode != ui_mode:
+        st.session_state.hist_mode    = ui_mode
+        st.session_state.hist_t       = []
+        st.session_state.hist_halted  = []
+
+    hist_t = st.session_state.hist_t
+    hist_h = st.session_state.hist_halted
+    if not hist_t or hist_t[-1] != cur_step:
+        hist_t.append(cur_step)
+        hist_h.append(sd["total_halted"])
+        st.session_state.hist_t      = hist_t
+        st.session_state.hist_halted = hist_h
+
+    # Derived live metrics
+    AVG_ARRIVAL_RATE = 1.5   # veh/s estimated across 3 junctions (from state log)
+    throughput_est = 0
+    if len(hist_h) > 1:
+        for i in range(1, len(hist_h)):
+            discharged = max(0.0, hist_h[i-1] - hist_h[i] + AVG_ARRIVAL_RATE)
+            throughput_est += discharged
+    throughput_est = int(throughput_est)
+
+    avg_queue_live = sum(hist_h) / len(hist_h) if hist_h else 0
 
     # ── Header ──────────────────────────────────────────────────────────────
     hcol1, hcol2 = st.columns([2, 1])
@@ -593,7 +627,7 @@ def main():
 
     st.divider()
 
-    # ── KPI cards ───────────────────────────────────────────────────────────
+    # ── Top KPI cards (final-run summary — headline numbers for judges) ──────
     base_avg  = data["baseline"]["summary"]["avg_halted"]
     adapt_avg = data["adaptive"]["summary"]["avg_halted"]
     reduction = round((base_avg - adapt_avg) / base_avg * 100) if base_avg else 0
@@ -630,15 +664,15 @@ def main():
     with col_side:
         st.markdown("**Controller Mode**")
         for key, info in MODES.items():
-            active = st.session_state.ui_mode == key
+            active = ui_mode == key
             label  = ("✅ " if active else "") + info["label"]
             if st.button(label, key=f"btn_{key}", use_container_width=True):
                 st.session_state.ui_mode = key
-                st.session_state.step = 0
+                st.session_state.step    = 0
+                _reset_history()
 
         st.markdown("---")
 
-        # Play / Pause
         p_col, s_col = st.columns(2)
         with p_col:
             if st.session_state.running:
@@ -650,6 +684,7 @@ def main():
         with s_col:
             if st.button("⏮ Reset", use_container_width=True):
                 st.session_state.step = 0
+                _reset_history()
 
         speed = st.select_slider("Speed", options=[1, 2, 3, 5, 8],
                                  value=st.session_state.sim_speed)
@@ -658,49 +693,60 @@ def main():
         st.markdown("---")
         st.markdown("**Signal States**")
 
-        # Look up current step data
-        ui_mode  = st.session_state.ui_mode
-        rkey     = MODES[ui_mode]["result_key"]
-        steps    = data[rkey]["steps"]
-        cur_step = min(st.session_state.step, len(steps) - 1)
-        sd       = steps[cur_step]
-        phases   = infer_signal_phases(sd, cur_step, ui_mode)
-
+        phases = get_phases_from_step(sd)
         for j in JUNCTIONS:
-            ph = phases[j]
-            ew_s = "🟢 EW" if ph == "EW_GREEN" else "🔴 EW"
-            ns_s = "🟢 NS" if ph == "NS_GREEN" else "🔴 NS"
-            q_ew = sd.get("per_j", {}).get(j, {}).get("ew", 0)
-            q_ns = sd.get("per_j", {}).get(j, {}).get("ns", 0)
+            ph    = phases[j]
+            q_ew  = sd.get("per_j", {}).get(j, {}).get("ew", 0)
+            q_ns  = sd.get("per_j", {}).get(j, {}).get("ns", 0)
+            # Emoji signal indicators based on real phase
+            if ph == "EW_GREEN":
+                ew_s, ns_s = "🟢 EW", "🔴 NS"
+            elif ph == "EW_YELLOW":
+                ew_s, ns_s = "🟡 EW", "🔴 NS"
+            elif ph == "NS_GREEN":
+                ew_s, ns_s = "🔴 EW", "🟢 NS"
+            elif ph == "NS_YELLOW":
+                ew_s, ns_s = "🔴 EW", "🟡 NS"
+            else:  # ALL_RED
+                ew_s, ns_s = "🔴 EW", "🔴 NS"
+
             st.markdown(
                 f"<div style='background:#161b22; border:1px solid #21262d; border-radius:8px;"
                 f" padding:8px 10px; margin-bottom:6px;'>"
                 f"<span style='color:#8b949e; font-size:0.85rem;'><b>{j}</b></span>"
                 f"&nbsp;&nbsp;{ew_s}&nbsp;{ns_s}<br/>"
-                f"<span style='color:#556; font-size:0.78rem;'>EW q={q_ew} · NS q={q_ns}</span>"
+                f"<span style='color:#556; font-size:0.78rem;'>EW q={q_ew} · NS q={q_ns} · {ph}</span>"
                 f"</div>",
                 unsafe_allow_html=True,
             )
 
         st.markdown("---")
         st.markdown("**Live Metrics**")
-        total_q = sd.get("total_halted", 0)
-        elapsed_s = cur_step
-        st.metric("Sim Time", f"{elapsed_s}s")
-        st.metric("Total Queued", total_q)
-        st.metric("Mode", MODES[ui_mode]["label"])
-        st.progress(min(1.0, cur_step / 599))
+        total_q   = sd.get("total_halted", 0)
+        prev_q    = hist_h[-2] if len(hist_h) >= 2 else total_q
+        delta_q   = total_q - prev_q
+
+        st.metric("Sim Time",       f"{cur_step}s",
+                  delta=f"{cur_step}/{SIM_LIMIT}s")
+        st.metric("Total Queued",   total_q,
+                  delta=f"{delta_q:+d}" if delta_q != 0 else None)
+        st.metric("Throughput",     f"~{throughput_est} veh",
+                  delta=f"+{int(AVG_ARRIVAL_RATE + max(0, prev_q - total_q))} this step" if cur_step > 0 else None)
+        st.metric("Avg Queue",      f"{avg_queue_live:.1f}")
+        st.progress(min(1.0, cur_step / max(1, SIM_LIMIT - 1)))
 
         if ui_mode == "emergency":
             st.markdown("---")
             st.markdown("**Emergency Vehicle**")
-            if cur_step < 120:
+            amb = sd.get("amb", {})
+            if not amb.get("active") and cur_step < 120:
                 st.info(f"🚑 Dispatching in {120 - cur_step}s…")
-            elif cur_step <= 209:
-                pct = (cur_step - 120) / 89
-                st.warning("🚑 En route…")
-                st.progress(min(1.0, pct))
-            else:
+            elif amb.get("active"):
+                pct = max(0, min(1.0, (amb.get("pos_m", 0) - AMB_ENTRY_OFFSET_M) /
+                                      (2 * AMB_JUNCTION_SPACING_M)))
+                st.warning(f"🚑 En route… ({amb.get('speed', 0):.0f} m/s)")
+                st.progress(pct)
+            elif cur_step > 0:
                 st.success(f"🏥 Arrived! Travel: {pcs_travel}s — 0 stops")
 
     with col_main:
@@ -715,19 +761,20 @@ def main():
             unsafe_allow_html=True,
         )
 
-        anim_placeholder = st.empty()
         anim_fig = draw_traffic_animation(sd, cur_step, ui_mode)
-        anim_placeholder.plotly_chart(anim_fig, use_container_width=True,
-                                      config={"displayModeBar": False})
+        st.plotly_chart(anim_fig, use_container_width=True,
+                        config={"displayModeBar": False})
 
     st.divider()
 
-    # ── Comparison charts (always visible, no tabs) ──────────────────────
+    # ── Live comparison charts (grow with simulation) ───────────────────────
     st.markdown("### Scenario Comparison")
     cc1, cc2 = st.columns([2, 1])
     with cc1:
-        st.plotly_chart(chart_queue_comparison(
-            data["baseline"]["steps"], data["adaptive"]["steps"]),
+        st.plotly_chart(
+            chart_queue_live(data["baseline"]["steps"][:SIM_LIMIT],
+                             data["adaptive"]["steps"][:SIM_LIMIT],
+                             cur_step),
             use_container_width=True, config={"displayModeBar": False})
     with cc2:
         st.plotly_chart(chart_avg_bar({
@@ -735,8 +782,9 @@ def main():
             "adaptive": data["adaptive"]["summary"],
         }), use_container_width=True, config={"displayModeBar": False})
 
-    st.plotly_chart(chart_per_junction(data["adaptive"]["steps"]),
-                    use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(
+        chart_per_junction_live(data["adaptive"]["steps"][:SIM_LIMIT], cur_step),
+        use_container_width=True, config={"displayModeBar": False})
 
     st.markdown("### Emergency Corridor")
     st.plotly_chart(chart_ambulance_timeline(
@@ -776,7 +824,7 @@ def main():
         if state_log_path.exists():
             with open(state_log_path) as f:
                 lines = f.read().strip().splitlines()
-                last = json.loads(lines[-1])
+                last  = json.loads(lines[-1])
             example_state = {
                 "intersection_id": "J0",
                 "timestamp": last.get("timestamp"),
@@ -822,13 +870,16 @@ if upstream departed > 2 vehicles within [travel_delay ± 3s]:
         " Inspired by SURTRAC (CMU), SCATS (NSW), Singapore TPS"
         "</div>", unsafe_allow_html=True)
 
-    # ── Animation loop (advance sim step and rerun) ──────────────────────
+    # ── Animation loop ───────────────────────────────────────────────────────
     if st.session_state.running:
-        st.session_state.step = (
-            st.session_state.step + st.session_state.sim_speed
-        ) % len(steps)
-        time.sleep(0.07)   # ~14 FPS at speed 1
-        st.rerun()
+        next_step = (cur_step + st.session_state.sim_speed) % len(steps)
+        # Stop at end of SIM_LIMIT — pause, don't loop
+        if cur_step >= len(steps) - 1:
+            st.session_state.running = False
+        else:
+            st.session_state.step = next_step
+            time.sleep(0.08)
+            st.rerun()
 
 
 if __name__ == "__main__":
