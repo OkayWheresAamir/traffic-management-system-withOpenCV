@@ -340,7 +340,7 @@ def draw_animation(sd: dict, sim_t: int) -> go.Figure:
         fig.add_trace(go.Scatter(
             x=vx, y=vy, mode="markers",
             marker=dict(color=vc, size=VEH_SZ, symbol=vsym,
-                        line=dict(color="#00000088", width=0.8)),
+                        line=dict(color="rgba(0,0,0,0.53)", width=0.8)),
             showlegend=False, hoverinfo="skip",
         ))
 
