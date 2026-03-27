@@ -175,11 +175,19 @@ while True:
     # logging once per second
     if now - last_tick >= 1.0:
         state = {
+            "intersection_id": "J0",
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)),
             "queue_length": queue_length,
             "arrival_rate": round(arrival_rate, 3),
             "departure_rate": round(departure_rate, 3),
-            "window_s": WINDOW
+            "window_s": WINDOW,
+            "approaches": {
+                "E": {
+                    "queue_count": queue_length,
+                    "arrival_rate_pps": round(arrival_rate, 3),
+                    "departure_rate_pps": round(departure_rate, 3),
+                }
+            },
         }
         with open(OUTPUT_LOG, "a") as f:
             f.write(json.dumps(state) + "\n")

@@ -47,3 +47,5 @@ ultralytics==8.4.21
 ultralytics-thop==2.0.18
 urllib3==2.6.3
 Werkzeug==3.1.6
+streamlit>=1.30.0
+plotly>=5.18.0
