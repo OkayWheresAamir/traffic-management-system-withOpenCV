@@ -1,112 +1,85 @@
-# FlowSense: Intelligent Traffic Management Prototype
+# FlowSense
 
-FlowSense is a traffic control prototype that combines:
+FlowSense is an intelligent traffic management system that combines video-based traffic sensing, signal control, and corridor-level simulation.
 
-- Computer vision based traffic state extraction from real video
-- A live, step-based, stochastic multi-intersection simulation
-- Adaptive and emergency-priority signal control
-- Dashboard-driven comparison against fixed timing
+The project has three core parts:
 
-The project is designed for rapid prototyping, demos, and judging/pitch presentations.
+- Traffic state extraction from video
+- Signal control logic (fixed, adaptive, and emergency-priority behavior)
+- Multi-intersection simulation and analysis
 
-## 1) What This Project Demonstrates
+## Overview
 
-- Live simulation (not replay): the dashboard updates one simulation tick per rerun.
-- Stochastic behavior: vehicle arrivals and movement vary across runs.
-- Multi-intersection corridor control: fixed vs adaptive timing.
-- Emergency handling: ambulance dispatch with signal pre-clear (green-wave behavior).
-- Video-derived benchmarking: traffic demand inferred from `state_log` is used to drive a wide-road corridor comparison at the bottom of the dashboard.
+FlowSense processes traffic video to estimate live traffic state, then uses that state to evaluate and compare different control strategies across intersections.
 
-## 2) Architecture Overview
+The system includes:
 
-### Layer A: CV State Estimation
-Input traffic video is processed with YOLO tracking to estimate:
+- Vehicle detection/tracking pipeline
+- Queue and flow estimation
+- Control logic for signal phase decisions
+- Emergency corridor behavior for priority movement
+- Dashboard and analysis outputs for comparison and monitoring
 
-- `queue_length`
-- `arrival_rate` (veh/s over rolling window)
-- `departure_rate` (veh/s over rolling window)
-
-These values are logged to `output/state_log.jsonl`.
-
-### Layer B: Local + Corridor Signal Logic
-Signals are controlled by mode:
-
-- `fixed`: cycle-based timing
-- `adaptive`: pressure-based switching with min/max green, hysteresis, and platoon hold
-- `emergency`: adaptive control with ambulance priority pre-clear
-
-### Layer C: Visualization and Evaluation
-Streamlit dashboard provides:
-
-- Live animation + KPI updates from current run only
-- Fixed vs adaptive comparison for completed live runs
-- CV snapshot with video
-- Video-derived, wide-road, multi-intersection benchmark (fixed vs adaptive)
-
-## 3) Core Control Logic (Formulas)
-
-### Pressure Metric
-For each approach/group:
-
-`Pressure = Queue + w * ArrivalRate`
-
-where `w` is a tunable weight (arrival look-ahead).
-
-### Adaptive Switching Rule
-Switch green when:
-
-- `time_in_phase >= MIN_GREEN`
-- opposing pressure exceeds current pressure by `HYSTERESIS`
-
-Force switch when:
-
-- `time_in_phase >= MAX_GREEN`
-
-### Delay Metric (Dashboard)
-
-`avg_delay = cumulative_wait_time / observed_vehicles`
-
-### Throughput
-
-`throughput = cumulative vehicles completed/served`
-
-### Emergency Priority (PCS-style behavior)
-
-- Ambulance dispatch occurs early in run
-- Junctions ahead are prioritized for EW green while ambulance approaches
-- Non-emergency vehicles yield and avoid centerline blocking
-
-## 4) Repository Structure
+## Project Structure
 
 ```text
 .
 ├── src/
-│   ├── dashboard.py          # Main Streamlit app (live simulation + benchmark views)
-│   ├── state_estimator.py    # CV state extraction to output/state_log.jsonl
-│   ├── detect_vehicles.py    # Simple YOLO vehicle detection
-│   ├── detect_track.py       # Homography + bird-eye visualization
-│   ├── demo_runner.py        # Optional offline scenario generator to results/*.json
-│   ├── controller.py         # Earlier standalone adaptive controller prototype
-│   └── zones.py              # Zone geometry helper
+│   ├── dashboard.py
+│   ├── state_estimator.py
+│   ├── detect_vehicles.py
+│   ├── detect_track.py
+│   ├── controller.py
+│   ├── demo_runner.py
+│   └── zones.py
 ├── output/
 │   ├── state_log.jsonl
 │   └── signal_log.jsonl
-├── results/                  # Offline JSON outputs (optional/legacy)
-├── analysis/                 # Plotting + summary scripts
-├── run_demo.sh               # Launches dashboard directly
+├── results/
+├── analysis/
+│   ├── metrics.py
+│   ├── counterfactual.py
+│   └── README.md
+├── data/
+├── run_demo.sh
 ├── requirements.txt
 └── yolov8n.pt
 ```
 
-## 5) Setup
+## Core Modules
 
-### Prerequisites
+### `src/state_estimator.py`
 
-- Python 3.10+ recommended
-- macOS/Linux shell commands below (Windows also works with equivalent commands)
-- `yolov8n.pt` available at repo root (already present in this project)
+- Reads traffic video
+- Tracks vehicles using YOLO
+- Estimates queue length, arrival rate, and departure rate
+- Writes traffic state to `output/state_log.jsonl`
 
-### Install
+### `src/controller.py`
+
+- Consumes latest traffic state
+- Runs adaptive signal switching logic
+- Logs decisions and signal state to `output/signal_log.jsonl`
+
+### `src/dashboard.py`
+
+- Runs live multi-intersection simulation
+- Supports fixed, adaptive, and emergency modes
+- Visualizes vehicles, signals, queues, and performance trends
+- Includes video-derived comparison scenarios
+
+### `src/demo_runner.py`
+
+- Optional offline scenario runner
+- Produces JSON result files under `results/`
+
+### `analysis/`
+
+- Generates evaluation charts and summary CSVs from recorded state logs
+
+## Setup
+
+Create and activate a virtual environment, then install dependencies:
 
 ```bash
 python -m venv venv
@@ -114,116 +87,72 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 6) Run Modes
-
-### A. Run the Live Dashboard (Primary Path)
+If the above fails, install the minimum dependencies for run instead:
 
 ```bash
-./run_demo.sh
+pip install --upgrade pip setuptools wheel
+pip install streamlit plotly numpy pandas
+python -c "import streamlit, plotly, numpy, pandas; print('OK')"
 ```
 
-or
+## How to Run
 
-```bash
-streamlit run src/dashboard.py
-```
-
-Open the local Streamlit URL shown in terminal.
-
-### B. Generate CV Traffic State from Video
+### 1) Generate traffic state from video
 
 ```bash
 python src/state_estimator.py
 ```
 
-This writes `output/state_log.jsonl` (used by the dashboard CV and benchmark sections).
+This creates/updates:
 
-### C. Optional: Run Detection / Homography Views
+- `output/state_log.jsonl`
+
+### 2) Run the dashboard
 
 ```bash
-python src/detect_vehicles.py --video data/videos/traffic.mp4 --output output/annotated.mp4
-python src/detect_track.py
+./run_demo.sh
 ```
 
-### D. Optional Offline Scenario Generator
+or:
+
+```bash
+streamlit run src/dashboard.py
+```
+
+### 3) Optional utilities
+
+Offline scenario generation:
 
 ```bash
 python src/demo_runner.py
 ```
 
-Writes scenario JSON files to `results/`.
-The current live dashboard does not depend on these files for top simulation.
-
-### E. Analysis Plots
+Analysis scripts:
 
 ```bash
 python analysis/metrics.py
 python analysis/counterfactual.py
 ```
 
-Outputs are saved under `analysis/figures/` and `analysis/figures_cf/`.
+## Data and Outputs
 
-## 7) Dashboard Walkthrough
+### Input
 
-### Top Section: Live Engine
+- Traffic video files under `data/videos/`
 
-- Mode buttons: `Fixed Timing`, `FlowSense Adaptive`, `Emergency Corridor`
-- One-step-per-rerun simulation
-- KPIs updated from current run state only:
-  - Sim Time
-  - Queue Length
-  - Throughput
-  - Avg Delay
-  - Avg Stops
-  - Active Vehicles
+### Runtime outputs
 
-### Mid Section
+- `output/state_log.jsonl`: estimated traffic state over time
+- `output/signal_log.jsonl`: signal/controller events and status
 
-- Fixed vs adaptive charts from completed live runs
-- CV snapshot and currently analyzed traffic video
+### Analysis outputs
 
-### Bottom Section
+- `analysis/summary.csv`
+- `analysis/cf_summary.csv`
+- Plots under `analysis/figures/` and `analysis/figures_cf/`
 
-- Video-derived wide-road corridor benchmark
-- Multi-intersection fixed vs adaptive comparison
-- Snapshot slider for side-by-side corridor state view
+## Notes
 
-## 8) Important Output Files
-
-- `output/state_log.jsonl`: CV-derived traffic state stream
-- `output/signal_log.jsonl`: controller logs (when using controller script)
-- `analysis/summary.csv`: baseline/adaptive summary
-- `analysis/cf_summary.csv`: counterfactual summary
-- `analysis/figures/*.png`: analysis figures
-
-## 9) Tuning Tips
-
-You can tune behavior by editing constants in:
-
-- `src/dashboard.py` for live simulation and video-derived benchmark parameters
-- `src/state_estimator.py` for detection thresholds and rolling window
-- `src/demo_runner.py` for offline scenario assumptions
-
-Recommended tuning targets:
-
-- Signal responsiveness: `MIN_GREEN`, `MAX_GREEN`, `HYSTERESIS`
-- Congestion stability: spawn rates and platoon hold thresholds
-- Emergency behavior: dispatch time and look-ahead distance
-
-## 10) Troubleshooting
-
-- Dashboard opens but no CV data:
-  - Run `python src/state_estimator.py` first to create/update `output/state_log.jsonl`.
-- CV scripts are slow:
-  - Lower input resolution, use smaller model, or run on GPU-enabled environment.
-- Streamlit import/runtime warnings outside Streamlit:
-  - Expected when importing `dashboard.py` directly in bare Python.
-- Missing video in CV snapshot:
-  - Dashboard checks `output/detection.mp4`, then `data/videos/traffic.mp4`.
-
-## 11) Current Status
-
-- Live simulation is session-state driven and stochastic.
-- Emergency dispatch and signal pre-clear are visible.
-- Vehicle overlap handling and platoon flow are improved.
-- Video-derived bottom benchmark now supports a wide-road multi-intersection corridor comparison.
+- `yolov8n.pt` is used by detection/tracking scripts.
+- If `output/state_log.jsonl` is missing, run the estimator before running state-driven comparisons.
+- `run_demo.sh` starts the dashboard directly.
