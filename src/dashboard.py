@@ -1,34 +1,20 @@
 """
-FlowSense — Live Traffic Simulation Dashboard
-=============================================
-Video → State Extraction → Simulation → Control → THIS DASHBOARD
+FlowSense — Live Stochastic Traffic Simulation Dashboard
+========================================================
+Step-based simulation driven entirely by st.session_state.
+No precomputed result playback.
 
-Layout (live-first):
-  ┌ Header + mode strip ──────────────────────────────────────┐
-  │ KPI row: Sim Time | Queued | Throughput | Avg Delay       │
-  ├ Animation (col 3) | Signal panel (col 1) ─────────────────┤
-  │ Live queue chart (current mode only, grows in real-time)  │
-  │ Per-junction live queue chart                             │
-  ├ ─── Compare Modes (expander) ─────────────────────────────┤
-  │ ─── Emergency Corridor (expander, emergency mode only) ───┤
-  └ ─── System Architecture (expander) ──────────────────────┘
-
-Data flow: results/*.json → session_state step index → sd (step data)
-  sd["per_j"][j] = {ew, ns, phase}   ← real signal phase from demo_runner.py
-  sd["amb"]      = {pos_m, active}    ← ambulance position (emergency only)
-  session_state.hist_halted           ← live history buffer, grows each frame
-
-Usage:  streamlit run src/dashboard.py
+Usage:
+    streamlit run src/dashboard.py
 """
 
 import json
 import time
 from pathlib import Path
 
-import streamlit as st
-import plotly.graph_objects as go
-import pandas as pd
 import numpy as np
+import plotly.graph_objects as go
+import streamlit as st
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -40,14 +26,86 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-RESULTS_DIR = Path("results")
-SIM_LIMIT   = 120     # demo runs for exactly 120 simulation seconds
-JUNCTIONS   = ["J0", "J1", "J2"]
+# ──────────────────────────────────────────────────────────────────────────────
+# CONSTANTS
+# ──────────────────────────────────────────────────────────────────────────────
+JUNCTIONS = ["J0", "J1", "J2"]
+JX = {"J0": 170, "J1": 430, "J2": 690}
+SIM_DURATION_DEFAULT = 300
+
+MODE_CFG = {
+    "fixed": {
+        "label": "Fixed Timing",
+        "color": "#f85149",
+        "spawn_eb": 1.00,
+        "spawn_wb": 0.85,
+        "spawn_ns": 0.75,
+    },
+    "adaptive": {
+        "label": "FlowSense Adaptive",
+        "color": "#58a6ff",
+        "spawn_eb": 0.90,
+        "spawn_wb": 0.78,
+        "spawn_ns": 0.66,
+    },
+    "emergency": {
+        "label": "Emergency Corridor",
+        "color": "#f59e0b",
+        "spawn_eb": 0.92,
+        "spawn_wb": 0.80,
+        "spawn_ns": 0.70,
+    },
+}
+
+PHASE_SIG = {
+    "EW_GREEN": ("#22c55e", "#ef4444"),
+    "EW_YELLOW": ("#eab308", "#ef4444"),
+    "NS_GREEN": ("#ef4444", "#22c55e"),
+    "NS_YELLOW": ("#ef4444", "#eab308"),
+    "ALL_RED": ("#ef4444", "#ef4444"),
+}
+
+# Signal timings
+MIN_GREEN = 10
+MAX_GREEN = 52
+YELLOW = 3
+ALL_RED = 1
+ADAPTIVE_HYSTERESIS = 2.8
+PLATOON_HOLD_THRESHOLD = 8
+PLATOON_HOLD_MARGIN = 4
+
+# Canvas geometry
+CW, CH = 860, 280
+ROAD_CY = 140
+ROAD_H = 18
+NS_W = 18
+STOP_OFF = 30
+VEH_SZ = 10
+MIN_GAP_PX = 18
+
+# Emergency defaults
+AMB_DISPATCH_T = 20
+AMB_BASE_SPEED = 24.0
+AMB_LOOKAHEAD_PX = 280
+NS_BASE_SPEED = 10.5
+YIELD_LATERAL_PX = 11.0
+ENTRY_CAP_PER_STEP = 2
+
+DARK = dict(
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+    font=dict(color="#e6edf3", size=12),
+    xaxis=dict(gridcolor="#21262d", linecolor="#30363d"),
+    yaxis=dict(gridcolor="#21262d", linecolor="#30363d"),
+    margin=dict(l=40, r=20, t=36, b=36),
+    legend=dict(bgcolor="rgba(0,0,0,0)", bordercolor="#30363d"),
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # STYLE
 # ──────────────────────────────────────────────────────────────────────────────
-st.markdown("""
+st.markdown(
+    """
 <style>
   .main,.block-container { background:#0d1117; color:#e6edf3; padding-top:.75rem; }
   .kpi-card {
@@ -63,339 +121,907 @@ st.markdown("""
   }
   h1,h2,h3 { color:#e6edf3 !important; }
 </style>
-""", unsafe_allow_html=True)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# CONSTANTS
-# ──────────────────────────────────────────────────────────────────────────────
-MODE_CFG = {
-    "fixed":     {"label":"Fixed Timing",       "color":"#f85149", "key":"baseline"},
-    "adaptive":  {"label":"FlowSense Adaptive",  "color":"#58a6ff", "key":"adaptive"},
-    "emergency": {"label":"Emergency Corridor",  "color":"#f59e0b", "key":"emergency_pcs"},
-}
-
-PHASE_SIG = {           # (EW signal colour, NS signal colour)
-    "EW_GREEN":  ("#22c55e", "#ef4444"),
-    "EW_YELLOW": ("#eab308", "#ef4444"),
-    "NS_GREEN":  ("#ef4444", "#22c55e"),
-    "NS_YELLOW": ("#ef4444", "#eab308"),
-    "ALL_RED":   ("#ef4444", "#ef4444"),
-}
-
-DARK = dict(
-    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-    font=dict(color="#e6edf3", size=12),
-    xaxis=dict(gridcolor="#21262d", linecolor="#30363d"),
-    yaxis=dict(gridcolor="#21262d", linecolor="#30363d"),
-    margin=dict(l=40, r=20, t=36, b=36),
-    legend=dict(bgcolor="rgba(0,0,0,0)", bordercolor="#30363d"),
+""",
+    unsafe_allow_html=True,
 )
 
-# Canvas geometry
-CW, CH       = 860, 280
-ROAD_CY      = 140
-ROAD_H       = 18      # half-height of EW road
-NS_W         = 18      # half-width of NS roads
-STOP_OFF     = 30      # stop-line distance from junction centre
-VEH_GAP      = 19      # gap between stacked queued vehicles
-VEH_SZ       = 10      # vehicle marker size (px)
-JX           = {"J0": 170, "J1": 430, "J2": 690}  # junction x-positions
 
-# Ambulance geometry (mirrors demo_runner.py)
-AMB_ENTRY_M  = 100.0
-AMB_SPACING_M= 500.0
-AMB_SCALE    = (JX["J2"] - JX["J0"]) / (2 * AMB_SPACING_M)   # px/m
+# ──────────────────────────────────────────────────────────────────────────────
+# SIMULATION STATE
+# ──────────────────────────────────────────────────────────────────────────────
+def _empty_history():
+    return {
+        "time": [],
+        "queue_length": [],
+        "throughput": [],
+        "avg_delay": [],
+        "avg_stops": [],
+        "active_vehicles": [],
+        "per_j_total": {j: [] for j in JUNCTIONS},
+    }
 
 
-def amb_to_x(pos_m: float) -> float:
-    return JX["J0"] + (pos_m - AMB_ENTRY_M) * AMB_SCALE
+def _new_sim(mode: str):
+    rng = np.random.default_rng()
+    sim = {
+        "time": 0,
+        "mode": mode,
+        "rng": rng,
+        "vehicles": [],
+        "signals": {
+            j: {
+                "phase": "EW_GREEN",
+                "time_in_phase": 0,
+                "last_green": "EW_GREEN",
+                "offset": i * 8,
+            }
+            for i, j in enumerate(JUNCTIONS)
+        },
+        "queues": {j: {"ew": 0, "ns": 0.0} for j in JUNCTIONS},
+        "metrics_history": _empty_history(),
+        "completed": False,
+        "throughput": 0,
+        "ambulance": {
+            "dispatched": False,
+            "active": False,
+            "completed": False,
+            "dispatch_t": AMB_DISPATCH_T,
+            "x": -65.0,
+            "speed": AMB_BASE_SPEED,
+            "base_speed": AMB_BASE_SPEED,
+            "delay_s": 0.0,
+            "stops": 0,
+            "status": "standby",
+            "entered_t": None,
+            "exit_t": None,
+            "stopped_junctions": set(),
+        },
+        "duration": SIM_DURATION_DEFAULT,
+        "next_vehicle_id": 1,
+        "recorded": False,
+        "totals": {
+            "completed": 0,
+            "delay_accum": 0.0,
+            "stops_accum": 0.0,
+        },
+    }
+    sim["snapshot"] = build_snapshot(sim)
+    append_metrics_history_step(sim)
+    return sim
+
+
+def _reset_sim(mode: str):
+    st.session_state.sim = _new_sim(mode)
+    st.session_state.running = True
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DATA LOADING
+# STEP PIPELINE
 # ──────────────────────────────────────────────────────────────────────────────
+def spawn_vehicles_step(sim: dict):
+    mode = sim["mode"]
+    cfg = MODE_CFG[mode]
+    rng = sim["rng"]
 
-@st.cache_data
-def load_results():
-    tags = ["baseline", "adaptive", "emergency_nopcs", "emergency_pcs"]
-    out  = {}
-    for tag in tags:
-        p = RESULTS_DIR / f"{tag}.json"
-        if p.exists():
-            with open(p) as f:
-                out[tag] = json.load(f)
-    if len(out) < 4:
-        return _make_fallback(), False
-    return out, True
+    # Random arrivals each step (Poisson), with mild temporal jitter.
+    # Apply simple perimeter gating to avoid corridor-wide gridlock.
+    network_q = sum(int(sim["queues"][j]["ew"] + round(sim["queues"][j]["ns"])) for j in JUNCTIONS)
+    if network_q > 90:
+        demand_scale = 0.45
+    elif network_q > 65:
+        demand_scale = 0.62
+    elif network_q > 40:
+        demand_scale = 0.8
+    else:
+        demand_scale = 1.0
 
+    eb_rate = max(0.05, cfg["spawn_eb"] + rng.normal(0, 0.08))
+    wb_rate = max(0.05, cfg["spawn_wb"] + rng.normal(0, 0.07))
+    ns_rate = max(0.05, cfg["spawn_ns"] + rng.normal(0, 0.06))
+    eb_rate *= demand_scale
+    wb_rate *= demand_scale
+    ns_rate *= demand_scale
 
-def _make_fallback():
-    """Minimal fallback if results/ files are missing."""
-    rng = np.random.RandomState(0)
-    T   = SIM_LIMIT
-    t   = np.arange(T)
+    spawn_eb = int(rng.poisson(eb_rate))
+    spawn_wb = int(rng.poisson(wb_rate))
 
-    def _smooth(arr):
-        return pd.Series(arr).rolling(5, min_periods=1, center=True).mean().tolist()
-
-    bh = _smooth(np.clip(3 + 20*(1-np.exp(-t/70)) + rng.normal(0,2,T), 0, None).tolist())
-    ah = _smooth(np.clip(2 +  9*(1-np.exp(-t/35)) + 3*np.sin(t/30) + rng.normal(0,1.5,T), 0, None).tolist())
-
-    CYCLES = {"fixed": 90, "adaptive": None}
-
-    def _per_j(h, t_, mode):
-        pj = {}
-        for i, j in enumerate(JUNCTIONS):
-            frac = [0.35, 0.4, 0.25][i]
-            off  = [0, 10, 20][i]
-            ph   = "EW_GREEN" if ((t_ + off) % 90) < 43 else "NS_GREEN"
-            pj[j] = {"ew": round(h*frac*0.5), "ns": round(h*frac*0.5), "phase": ph}
-        return pj
-
-    def _build(tag, h_arr, amb_info=None):
-        steps = []
-        for t_, h in enumerate(h_arr):
-            sd = {"t": t_, "total_halted": round(h), "per_j": _per_j(h, t_, tag)}
-            if amb_info:
-                sd["amb"] = {
-                    "pos_m":  max(0.0, (t_-120)*14.0),
-                    "active": bool(120 <= t_ <= 209),
-                    "speed":  14.0,
+    for k in range(spawn_eb):
+        x0 = -18.0 - k * MIN_GAP_PX
+        if _lane_has_space_x(sim["vehicles"], "eb", x0):
+            v_speed = float(rng.uniform(12.5, 18.0))
+            sim["vehicles"].append(
+                {
+                    "id": sim["next_vehicle_id"],
+                    "lane": "eb",
+                    "x": x0,
+                    "y": ROAD_CY - 8.0,
+                    "speed": v_speed,
+                    "base_speed": v_speed,
+                    "moving": True,
+                    "delay_s": 0.0,
+                    "stops": 0,
+                    "was_moving": True,
+                    "yielding": False,
+                    "yield_side": -1 if sim["next_vehicle_id"] % 2 == 0 else 1,
                 }
-            steps.append(sd)
-        avg = round(sum(h_arr)/len(h_arr), 1)
-        return {"tag": tag, "steps": steps,
-                "summary": {"avg_halted": avg, "peak_halted": round(max(h_arr), 1),
-                            **(amb_info or {})}}
+            )
+            sim["next_vehicle_id"] += 1
+
+    for k in range(spawn_wb):
+        x0 = CW + 18.0 + k * MIN_GAP_PX
+        if _lane_has_space_x(sim["vehicles"], "wb", x0):
+            v_speed = float(rng.uniform(11.5, 17.0))
+            sim["vehicles"].append(
+                {
+                    "id": sim["next_vehicle_id"],
+                    "lane": "wb",
+                    "x": x0,
+                    "y": ROAD_CY + 8.0,
+                    "speed": v_speed,
+                    "base_speed": v_speed,
+                    "moving": True,
+                    "delay_s": 0.0,
+                    "stops": 0,
+                    "was_moving": True,
+                }
+            )
+            sim["next_vehicle_id"] += 1
+
+    # Vertical NS movement (south -> north) per junction.
+    for j in JUNCTIONS:
+        spawn_ns = int(rng.poisson(ns_rate))
+        lane = f"ns_{j}"
+        x_lane = JX[j] + 6.0
+        for k in range(spawn_ns):
+            y0 = CH + 18.0 + k * MIN_GAP_PX
+            if _lane_has_space_y(sim["vehicles"], lane, y0):
+                v_speed = float(rng.uniform(NS_BASE_SPEED - 2.0, NS_BASE_SPEED + 2.0))
+                sim["vehicles"].append(
+                    {
+                        "id": sim["next_vehicle_id"],
+                        "lane": lane,
+                        "x": x_lane,
+                        "y": y0,
+                        "speed": v_speed,
+                        "base_speed": v_speed,
+                        "moving": True,
+                        "delay_s": 0.0,
+                        "stops": 0,
+                        "was_moving": True,
+                    }
+                )
+                sim["next_vehicle_id"] += 1
+
+
+def _lane_has_space_x(vehicles: list, lane: str, x_spawn: float) -> bool:
+    for v in vehicles:
+        if v["lane"] == lane and abs(v["x"] - x_spawn) < MIN_GAP_PX:
+            return False
+    return True
+
+
+def _lane_has_space_y(vehicles: list, lane: str, y_spawn: float) -> bool:
+    for v in vehicles:
+        if v["lane"] == lane and abs(v["y"] - y_spawn) < MIN_GAP_PX:
+            return False
+    return True
+
+
+def _emergency_priority_junctions(sim: dict) -> set:
+    if sim["mode"] != "emergency":
+        return set()
+    amb = sim["ambulance"]
+    if not amb.get("active"):
+        return set()
+
+    ax = amb["x"]
+    prio = set()
+    for j, jx in JX.items():
+        if 0 <= (jx - ax) <= AMB_LOOKAHEAD_PX:
+            prio.add(j)
+    return prio
+
+
+def _ensure_emergency_dispatch(sim: dict):
+    amb = sim["ambulance"]
+    if sim["mode"] != "emergency":
+        return
+    if not amb["dispatched"] and sim["time"] >= amb["dispatch_t"]:
+        amb["dispatched"] = True
+        amb["active"] = True
+        amb["entered_t"] = sim["time"]
+        amb["x"] = -65.0
+        amb["status"] = "dispatched"
+
+
+def update_signals_step(sim: dict):
+    mode = sim["mode"]
+    rng = sim["rng"]
+    priority = _emergency_priority_junctions(sim)
+
+    if mode == "fixed":
+        cycle = 64
+        for j in JUNCTIONS:
+            s = sim["signals"][j]
+            c = (sim["time"] + s["offset"]) % cycle
+            if c < 25:
+                s["phase"] = "EW_GREEN"
+            elif c < 28:
+                s["phase"] = "EW_YELLOW"
+            elif c < 29:
+                s["phase"] = "ALL_RED"
+            elif c < 54:
+                s["phase"] = "NS_GREEN"
+            elif c < 57:
+                s["phase"] = "NS_YELLOW"
+            else:
+                s["phase"] = "ALL_RED"
+        return
+
+    for j in JUNCTIONS:
+        s = sim["signals"][j]
+        s["time_in_phase"] += 1
+        force_ew = j in priority
+
+        if s["phase"] in ("EW_YELLOW", "NS_YELLOW"):
+            if s["time_in_phase"] >= YELLOW:
+                s["phase"] = "ALL_RED"
+                s["time_in_phase"] = 0
+            continue
+
+        if s["phase"] == "ALL_RED":
+            if s["time_in_phase"] >= ALL_RED:
+                if force_ew:
+                    s["phase"] = "EW_GREEN"
+                else:
+                    s["phase"] = "NS_GREEN" if s["last_green"] == "EW_GREEN" else "EW_GREEN"
+                s["time_in_phase"] = 0
+            continue
+
+        # Emergency green-wave hold for EW.
+        if force_ew and s["phase"] == "EW_GREEN":
+            continue
+        if force_ew and s["phase"] == "NS_GREEN" and s["time_in_phase"] >= 3:
+            s["last_green"] = "NS_GREEN"
+            s["phase"] = "NS_YELLOW"
+            s["time_in_phase"] = 0
+            continue
+
+        q_ew = sim["queues"][j]["ew"]
+        q_ns = sim["queues"][j]["ns"]
+        p_ew = q_ew + float(rng.uniform(0, 1.0)) + (3.0 if force_ew else 0.0)
+        p_ns = q_ns + float(rng.uniform(0, 1.0))
+
+        switch = False
+        if s["time_in_phase"] >= MIN_GREEN:
+            active_q = q_ew if s["phase"] == "EW_GREEN" else q_ns
+            opp_q = q_ns if s["phase"] == "EW_GREEN" else q_ew
+            if s["phase"] == "EW_GREEN" and p_ns > p_ew + ADAPTIVE_HYSTERESIS:
+                switch = True
+            elif s["phase"] == "NS_GREEN" and p_ew > p_ns + ADAPTIVE_HYSTERESIS:
+                switch = True
+            if switch:
+                # Hold current green long enough to discharge a visible platoon.
+                hold_platoon = (
+                    active_q >= PLATOON_HOLD_THRESHOLD
+                    and opp_q <= active_q + PLATOON_HOLD_MARGIN
+                    and s["time_in_phase"] < int(MAX_GREEN * 0.85)
+                )
+                if hold_platoon:
+                    switch = False
+        if s["time_in_phase"] >= MAX_GREEN:
+            switch = True
+
+        if switch:
+            s["last_green"] = s["phase"]
+            s["phase"] = "EW_YELLOW" if s["phase"] == "EW_GREEN" else "NS_YELLOW"
+            s["time_in_phase"] = 0
+
+
+def _ew_allows_motion(phase: str) -> bool:
+    return phase == "EW_GREEN"
+
+
+def _ns_allows_motion(phase: str) -> bool:
+    return phase == "NS_GREEN"
+
+
+def _junction_conflict_bounds(jx: float):
+    return (
+        jx - NS_W - 4,
+        jx + NS_W + 4,
+        ROAD_CY - ROAD_H - 4,
+        ROAD_CY + ROAD_H + 4,
+    )
+
+
+def _vehicle_in_junction_conflict(v: dict, j: str) -> bool:
+    jx = JX[j]
+    x0, x1, y0, y1 = _junction_conflict_bounds(jx)
+    return x0 <= float(v.get("x", -9999)) <= x1 and y0 <= float(v.get("y", -9999)) <= y1
+
+
+def _junction_conflict_blocked(vehicles: list, j: str, entering_lane: str, vid: int) -> bool:
+    for ov in vehicles:
+        if ov["id"] == vid:
+            continue
+        if entering_lane in ("eb", "wb"):
+            if ov["lane"] == f"ns_{j}" and _vehicle_in_junction_conflict(ov, j):
+                return True
+        else:
+            if ov["lane"] in ("eb", "wb") and _vehicle_in_junction_conflict(ov, j):
+                return True
+    return False
+
+
+def _entry_cap(sim: dict, j: str, lane: str) -> int:
+    if lane in ("eb", "wb"):
+        q = float(sim["queues"][j]["ew"])
+    else:
+        q = float(sim["queues"][j]["ns"])
+    cap = ENTRY_CAP_PER_STEP + int(min(3, q // 10))
+    if q >= 24:
+        cap += 1
+    return int(max(1, min(6, cap)))
+
+
+def _downstream_clear_for_entry(vehicles: list, j: str, lane: str, vid: int) -> bool:
+    jx = JX[j]
+    if lane == "eb":
+        for ov in vehicles:
+            if ov["id"] == vid or ov["lane"] != "eb":
+                continue
+            ov_slow = (not ov.get("moving", True)) or float(ov.get("speed", 0.0)) < 7.5
+            if ov_slow and jx + NS_W + 8 <= ov["x"] <= jx + NS_W + 42 and abs(ov.get("y", ROAD_CY - 8.0) - (ROAD_CY - 8.0)) < 14:
+                return False
+        return True
+    if lane == "wb":
+        for ov in vehicles:
+            if ov["id"] == vid or ov["lane"] != "wb":
+                continue
+            ov_slow = (not ov.get("moving", True)) or float(ov.get("speed", 0.0)) < 7.5
+            if ov_slow and jx - NS_W - 42 <= ov["x"] <= jx - NS_W - 8 and abs(ov.get("y", ROAD_CY + 8.0) - (ROAD_CY + 8.0)) < 14:
+                return False
+        return True
+
+    lane_id = f"ns_{j}"
+    for ov in vehicles:
+        if ov["id"] == vid or ov["lane"] != lane_id:
+            continue
+        ov_slow = (not ov.get("moving", True)) or float(ov.get("speed", 0.0)) < 6.0
+        if ov_slow and ROAD_CY - ROAD_H - 38 <= ov["y"] <= ROAD_CY - ROAD_H + 8:
+            return False
+    return True
+
+
+def update_vehicle_positions_step(sim: dict):
+    vehicles = sim["vehicles"]
+    removed = []
+    amb = sim["ambulance"]
+    emergency_active = sim["mode"] == "emergency" and amb.get("active", False)
+    amb_x = amb["x"] if emergency_active else -9999
+    entry_count = {(j, lane): 0 for j in JUNCTIONS for lane in ("eb", "wb", "ns")}
+
+    # Eastbound lane (x increasing)
+    eb = sorted([v for v in vehicles if v["lane"] == "eb"], key=lambda x: x["x"], reverse=True)
+    lead_x = None
+    for v in eb:
+        # Baseline speed recovers naturally unless yielding.
+        v["speed"] = max(5.0, float(v.get("base_speed", v["speed"])) * float(sim["rng"].uniform(0.95, 1.05)))
+
+        # Emergency yielding behavior: pull to the side and slow.
+        in_yield_zone = emergency_active and (amb_x - 20 <= v["x"] <= amb_x + 180)
+        v["yielding"] = bool(in_yield_zone)
+        target_y = ROAD_CY - 8.0
+        if v["yielding"]:
+            target_y += float(v.get("yield_side", 1)) * YIELD_LATERAL_PX
+            v["speed"] = min(v["speed"], float(v.get("base_speed", v["speed"])) * 0.65)
+        v["y"] += max(-2.2, min(2.2, target_y - v["y"]))
+
+        desired = v["x"] + v["speed"]
+        block = None
+        crossing = None
+
+        for j, jx in JX.items():
+            stop_x = jx - STOP_OFF - 3
+            if v["x"] <= stop_x and desired >= stop_x:
+                crossing = (j, stop_x)
+                break
+
+        if crossing is not None:
+            cj, stop_x = crossing
+            can_enter = (
+                _ew_allows_motion(sim["signals"][cj]["phase"])
+                and entry_count[(cj, "eb")] < _entry_cap(sim, cj, "eb")
+                and not _junction_conflict_blocked(vehicles, cj, "eb", v["id"])
+                and _downstream_clear_for_entry(vehicles, cj, "eb", v["id"])
+            )
+            if not can_enter:
+                block = stop_x if block is None else min(block, stop_x)
+            else:
+                entry_count[(cj, "eb")] += 1
+
+        nx = desired
+        if block is not None:
+            nx = min(nx, block)
+        if lead_x is not None:
+            nx = min(nx, lead_x - MIN_GAP_PX)
+
+        moved = nx > v["x"] + 0.1
+        if not moved:
+            v["delay_s"] += 1.0
+            if v["was_moving"]:
+                v["stops"] += 1
+        v["moving"] = moved
+        v["was_moving"] = moved
+        v["x"] = nx
+        lead_x = nx
+
+        if v["x"] > CW + 25:
+            removed.append(v)
+
+    # Westbound lane (x decreasing)
+    wb = sorted([v for v in vehicles if v["lane"] == "wb"], key=lambda x: x["x"])
+    lead_x = None
+    for v in wb:
+        v["speed"] = max(5.0, float(v.get("base_speed", v["speed"])) * float(sim["rng"].uniform(0.95, 1.05)))
+        v["y"] += max(-2.2, min(2.2, (ROAD_CY + 8.0) - v["y"]))
+
+        desired = v["x"] - v["speed"]
+        block = None
+        crossing = None
+
+        for j, jx in JX.items():
+            stop_x = jx + STOP_OFF + 3
+            if v["x"] >= stop_x and desired <= stop_x:
+                crossing = (j, stop_x)
+                break
+
+        if crossing is not None:
+            cj, stop_x = crossing
+            can_enter = (
+                _ew_allows_motion(sim["signals"][cj]["phase"])
+                and entry_count[(cj, "wb")] < _entry_cap(sim, cj, "wb")
+                and not _junction_conflict_blocked(vehicles, cj, "wb", v["id"])
+                and _downstream_clear_for_entry(vehicles, cj, "wb", v["id"])
+            )
+            if not can_enter:
+                block = stop_x if block is None else max(block, stop_x)
+            else:
+                entry_count[(cj, "wb")] += 1
+
+        nx = desired
+        if block is not None:
+            nx = max(nx, block)
+        if lead_x is not None:
+            nx = max(nx, lead_x + MIN_GAP_PX)
+
+        moved = nx < v["x"] - 0.1
+        if not moved:
+            v["delay_s"] += 1.0
+            if v["was_moving"]:
+                v["stops"] += 1
+        v["moving"] = moved
+        v["was_moving"] = moved
+        v["x"] = nx
+        lead_x = nx
+
+        if v["x"] < -25:
+            removed.append(v)
+
+    # Vertical NS lanes (south -> north), one per junction.
+    for j, jx in JX.items():
+        lane = f"ns_{j}"
+        ns = sorted([v for v in vehicles if v["lane"] == lane], key=lambda x: x["y"])
+        lead_y = None
+        stop_y = ROAD_CY + STOP_OFF + 3
+        for v in ns:
+            v["speed"] = max(4.5, float(v.get("base_speed", v["speed"])) * float(sim["rng"].uniform(0.94, 1.06)))
+            desired = v["y"] - v["speed"]
+            if v["y"] >= stop_y and desired <= stop_y:
+                can_enter = (
+                    _ns_allows_motion(sim["signals"][j]["phase"])
+                    and entry_count[(j, "ns")] < _entry_cap(sim, j, "ns")
+                    and not _junction_conflict_blocked(vehicles, j, "ns", v["id"])
+                    and _downstream_clear_for_entry(vehicles, j, "ns", v["id"])
+                )
+                if not can_enter:
+                    desired = stop_y
+                else:
+                    entry_count[(j, "ns")] += 1
+            if lead_y is not None:
+                desired = max(desired, lead_y + MIN_GAP_PX)
+
+            moved = desired < v["y"] - 0.1
+            if not moved:
+                v["delay_s"] += 1.0
+                if v["was_moving"]:
+                    v["stops"] += 1
+            v["moving"] = moved
+            v["was_moving"] = moved
+            v["y"] = desired
+            lead_y = desired
+
+            if v["y"] < -25:
+                removed.append(v)
+
+    if removed:
+        for v in removed:
+            sim["totals"]["completed"] += 1
+            sim["totals"]["delay_accum"] += v["delay_s"]
+            sim["totals"]["stops_accum"] += v["stops"]
+            sim["throughput"] += 1
+        sim["vehicles"] = [v for v in sim["vehicles"] if v not in removed]
+
+
+def update_emergency_step(sim: dict):
+    amb = sim["ambulance"]
+    if sim["mode"] != "emergency":
+        amb["status"] = "standby"
+        return
+
+    _ensure_emergency_dispatch(sim)
+
+    if not amb["active"] or amb["completed"]:
+        return
+
+    desired = amb["x"] + amb["speed"]
+    blocked = None
+
+    for j, jx in JX.items():
+        stop_x = jx - STOP_OFF - 4
+        if amb["x"] <= stop_x and desired >= stop_x:
+            if not _ew_allows_motion(sim["signals"][j]["phase"]):
+                blocked = stop_x if blocked is None else min(blocked, stop_x)
+                if j not in amb["stopped_junctions"]:
+                    amb["stopped_junctions"].add(j)
+                    amb["stops"] += 1
+
+    nx = desired if blocked is None else min(desired, blocked)
+
+    # Never pass through vehicles in the center corridor; maintain a hard gap.
+    centerline_ahead = [
+        v
+        for v in sim["vehicles"]
+        if v["lane"] == "eb" and v["x"] > amb["x"] and abs(v.get("y", ROAD_CY - 8.0) - (ROAD_CY - 8.0)) < 7.0
+    ]
+    if centerline_ahead:
+        lead = min(centerline_ahead, key=lambda v: v["x"])
+        nx = min(nx, lead["x"] - (MIN_GAP_PX + 2))
+
+    moved = nx > amb["x"] + 0.1
+
+    if not moved:
+        amb["delay_s"] += 1.0
+        amb["status"] = "waiting_signal_or_traffic"
+    else:
+        amb["status"] = "en_route"
+
+    amb["x"] = nx
+
+    if amb["x"] > CW + 50:
+        amb["active"] = False
+        amb["completed"] = True
+        amb["exit_t"] = sim["time"]
+        amb["status"] = "arrived"
+
+
+def update_queues_and_stops_step(sim: dict):
+    # EW queue derived from actual stopped vehicles near stop lines.
+    for j, jx in JX.items():
+        stop_eb = jx - STOP_OFF - 3
+        stop_wb = jx + STOP_OFF + 3
+        stop_ns = ROAD_CY + STOP_OFF + 3
+
+        q_eb = 0
+        q_wb = 0
+        q_ns = 0
+        for v in sim["vehicles"]:
+            if v["lane"] == "eb" and not v["moving"] and stop_eb - 160 <= v["x"] <= stop_eb + 6:
+                q_eb += 1
+            if v["lane"] == "wb" and not v["moving"] and stop_wb - 6 <= v["x"] <= stop_wb + 160:
+                q_wb += 1
+            if v["lane"] == f"ns_{j}" and not v["moving"] and stop_ns - 4 <= v["y"] <= CH + 30:
+                q_ns += 1
+
+        sim["queues"][j]["ew"] = q_eb + q_wb
+        sim["queues"][j]["ns"] = float(q_ns)
+
+
+def append_metrics_history_step(sim: dict):
+    h = sim["metrics_history"]
+
+    q_total = 0
+    for j in JUNCTIONS:
+        q_total += int(sim["queues"][j]["ew"] + round(sim["queues"][j]["ns"]))
+
+    active_count = len(sim["vehicles"]) + (1 if sim["ambulance"].get("active") else 0)
+    observed = sim["totals"]["completed"] + len(sim["vehicles"])
+
+    delay_total = sim["totals"]["delay_accum"] + sum(v["delay_s"] for v in sim["vehicles"])
+    stops_total = sim["totals"]["stops_accum"] + sum(v["stops"] for v in sim["vehicles"])
+
+    avg_delay = (delay_total / observed) if observed > 0 else 0.0
+    avg_stops = (stops_total / observed) if observed > 0 else 0.0
+
+    h["time"].append(sim["time"])
+    h["queue_length"].append(q_total)
+    h["throughput"].append(sim["throughput"])
+    h["avg_delay"].append(avg_delay)
+    h["avg_stops"].append(avg_stops)
+    h["active_vehicles"].append(active_count)
+    for j in JUNCTIONS:
+        h["per_j_total"][j].append(int(sim["queues"][j]["ew"] + round(sim["queues"][j]["ns"])))
+
+
+def simulation_step(sim: dict):
+    if sim["completed"]:
+        return
+
+    spawn_vehicles_step(sim)
+    _ensure_emergency_dispatch(sim)
+    update_signals_step(sim)
+    update_vehicle_positions_step(sim)
+    update_emergency_step(sim)
+    update_queues_and_stops_step(sim)
+
+    sim["time"] += 1
+    if sim["time"] >= sim["duration"]:
+        sim["time"] = sim["duration"]
+        sim["completed"] = True
+
+    sim["snapshot"] = build_snapshot(sim)
+    append_metrics_history_step(sim)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SNAPSHOT / METRICS
+# ──────────────────────────────────────────────────────────────────────────────
+def build_snapshot(sim: dict) -> dict:
+    per_j = {}
+    total_halted = 0
+    for j in JUNCTIONS:
+        ew = int(sim["queues"][j]["ew"])
+        ns = int(round(sim["queues"][j]["ns"]))
+        total_halted += ew + ns
+        per_j[j] = {
+            "ew": ew,
+            "ns": ns,
+            "phase": sim["signals"][j]["phase"],
+        }
+
+    vehicles = [
+        {
+            "id": v["id"],
+            "x": float(v["x"]),
+            "y": float(v["y"]),
+            "lane": v["lane"],
+            "moving": bool(v["moving"]),
+            "stopped": bool(not v["moving"]),
+        }
+        for v in sim["vehicles"]
+    ]
+
+    amb = sim["ambulance"]
+    amb_out = {
+        "active": bool(amb.get("active")),
+        "pos_x": float(amb.get("x", -65.0)),
+        "status": amb.get("status", "standby"),
+        "stops": int(amb.get("stops", 0)),
+        "delay_s": float(amb.get("delay_s", 0.0)),
+        "entered_t": amb.get("entered_t"),
+        "exit_t": amb.get("exit_t"),
+    }
 
     return {
-        "baseline":        _build("baseline", bh),
-        "adaptive":        _build("adaptive", ah),
-        "emergency_nopcs": _build("emergency_nopcs", ah,
-                                  {"ambulance_travel_s":186,"ambulance_enter_t":120,
-                                   "ambulance_exit_t":306,"ambulance_stops":4}),
-        "emergency_pcs":   _build("emergency_pcs", ah,
-                                  {"ambulance_travel_s":89,"ambulance_enter_t":120,
-                                   "ambulance_exit_t":209,"ambulance_stops":0}),
+        "t": sim["time"],
+        "per_j": per_j,
+        "total_halted": total_halted,
+        "vehicles": vehicles,
+        "amb": amb_out,
+    }
+
+
+def latest_metrics(sim: dict) -> dict:
+    h = sim["metrics_history"]
+    if not h["time"]:
+        return {
+            "sim_time": 0,
+            "queue_length": 0,
+            "throughput": 0,
+            "avg_delay": 0.0,
+            "avg_stops": 0.0,
+            "active_vehicles": 0,
+        }
+    i = -1
+    return {
+        "sim_time": h["time"][i],
+        "queue_length": h["queue_length"][i],
+        "throughput": h["throughput"][i],
+        "avg_delay": h["avg_delay"][i],
+        "avg_stops": h["avg_stops"][i],
+        "active_vehicles": h["active_vehicles"][i],
     }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PHASE HELPER
+# VISUALS
 # ──────────────────────────────────────────────────────────────────────────────
+def kpi(label: str, val, delta: str = "", col: str = "#58a6ff") -> str:
+    delta_html = f"<div class='kpi-delta'>{delta}</div>" if delta else ""
+    return (
+        f"<div class='kpi-card'>"
+        f"<div class='kpi-val' style='color:{col}'>{val}</div>"
+        f"{delta_html}"
+        f"<div class='kpi-label'>{label}</div>"
+        f"</div>"
+    )
 
-def phases_of(sd: dict) -> dict:
-    """Read real signal phases from step data (exported by demo_runner.py)."""
-    pj = sd.get("per_j", {})
-    return {j: pj.get(j, {}).get("phase", "EW_GREEN") for j in JUNCTIONS}
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# TRAFFIC ANIMATION
-# Bug fix: ALL road/intersection shapes must use layer="below" so they render
-# under the vehicle markers.  Without this, the grey road rectangles paint
-# over every vehicle dot and nothing is visible.
-# ──────────────────────────────────────────────────────────────────────────────
-
-def draw_animation(sd: dict, sim_t: int) -> go.Figure:
-    """
-    Render the 3-junction corridor.
-
-    Vehicle model:
-      - Queued EW: stacked upstream of stop line, one dot per vehicle in queue
-      - Queued NS: stacked above intersection, one dot per vehicle
-      - Free-flow EW: wrap-around dots moving east; hidden in stop-line zone
-      - Free-flow WB: wrap-around dots moving west (independent lane)
-      - Ambulance: position from sd["amb"]["pos_m"] (diamond marker)
-
-    All shapes use layer="below" so vehicle scatter is always on top.
-    """
-    phases = phases_of(sd)
-    pj     = sd.get("per_j", {})
-    amb    = sd.get("amb", {})
-    BG     = "#111318"
+def draw_animation(snapshot: dict) -> go.Figure:
+    per_j = snapshot.get("per_j", {})
+    vehicles = snapshot.get("vehicles", [])
+    amb = snapshot.get("amb", {})
 
     fig = go.Figure()
+    bg = "#111318"
 
-    # ── Road surfaces (layer="below" so vehicles appear on top) ──────────────
-    # Dark canvas background
-    fig.add_shape(type="rect", x0=0, x1=CW, y0=0, y1=CH,
-                  fillcolor=BG, line_width=0, layer="below")
-    # EW arterial
-    fig.add_shape(type="rect", x0=0, x1=CW,
-                  y0=ROAD_CY-ROAD_H, y1=ROAD_CY+ROAD_H,
-                  fillcolor="#252530", line_width=0, layer="below")
-    # EW centre-line dashes
+    # Background and roads
+    fig.add_shape(type="rect", x0=0, x1=CW, y0=0, y1=CH, fillcolor=bg, line_width=0, layer="below")
+    fig.add_shape(
+        type="rect",
+        x0=0,
+        x1=CW,
+        y0=ROAD_CY - ROAD_H,
+        y1=ROAD_CY + ROAD_H,
+        fillcolor="#252530",
+        line_width=0,
+        layer="below",
+    )
+
     for x in range(10, CW, 30):
-        fig.add_shape(type="line", x0=x, x1=x+16, y0=ROAD_CY, y1=ROAD_CY,
-                      line=dict(color="#3a3a4a", width=1, dash="dash"), layer="below")
+        fig.add_shape(
+            type="line",
+            x0=x,
+            x1=x + 16,
+            y0=ROAD_CY,
+            y1=ROAD_CY,
+            line=dict(color="#3a3a4a", width=1, dash="dash"),
+            layer="below",
+        )
 
     for j, jx in JX.items():
-        # NS road
-        fig.add_shape(type="rect",
-                      x0=jx-NS_W, x1=jx+NS_W, y0=0, y1=CH,
-                      fillcolor="#252530", line_width=0, layer="below")
-        # NS centre-line dashes (above intersection)
-        for y in range(8, ROAD_CY-ROAD_H, 22):
-            fig.add_shape(type="line", x0=jx, x1=jx, y0=y, y1=y+12,
-                          line=dict(color="#3a3a4a", width=1, dash="dash"), layer="below")
-        for y in range(ROAD_CY+ROAD_H+8, CH, 22):
-            fig.add_shape(type="line", x0=jx, x1=jx, y0=y, y1=y+12,
-                          line=dict(color="#3a3a4a", width=1, dash="dash"), layer="below")
-        # Intersection box (slightly lighter)
-        fig.add_shape(type="rect",
-                      x0=jx-NS_W, x1=jx+NS_W,
-                      y0=ROAD_CY-ROAD_H, y1=ROAD_CY+ROAD_H,
-                      fillcolor="#1e1e28", line_width=0, layer="below")
-        # EW stop line (west side of intersection)
-        fig.add_shape(type="line",
-                      x0=jx-STOP_OFF, x1=jx-STOP_OFF,
-                      y0=ROAD_CY-ROAD_H, y1=ROAD_CY,
-                      line=dict(color="#555", width=2), layer="below")
-        # WB stop line (east side)
-        fig.add_shape(type="line",
-                      x0=jx+STOP_OFF, x1=jx+STOP_OFF,
-                      y0=ROAD_CY, y1=ROAD_CY+ROAD_H,
-                      line=dict(color="#555", width=2), layer="below")
-        # NS stop line (south approach)
-        fig.add_shape(type="line",
-                      x0=jx, x1=jx+NS_W,
-                      y0=ROAD_CY-STOP_OFF, y1=ROAD_CY-STOP_OFF,
-                      line=dict(color="#555", width=2), layer="below")
+        fig.add_shape(type="rect", x0=jx - NS_W, x1=jx + NS_W, y0=0, y1=CH, fillcolor="#252530", line_width=0, layer="below")
+        fig.add_shape(
+            type="rect",
+            x0=jx - NS_W,
+            x1=jx + NS_W,
+            y0=ROAD_CY - ROAD_H,
+            y1=ROAD_CY + ROAD_H,
+            fillcolor="#1e1e28",
+            line_width=0,
+            layer="below",
+        )
 
-    # ── Vehicles (drawn as scatter — on top because no layer="below") ────────
-    vx, vy, vc, vsym = [], [], [], []
+        fig.add_shape(
+            type="line",
+            x0=jx - STOP_OFF,
+            x1=jx - STOP_OFF,
+            y0=ROAD_CY - ROAD_H,
+            y1=ROAD_CY,
+            line=dict(color="#666", width=2),
+            layer="below",
+        )
+        fig.add_shape(
+            type="line",
+            x0=jx + STOP_OFF,
+            x1=jx + STOP_OFF,
+            y0=ROAD_CY,
+            y1=ROAD_CY + ROAD_H,
+            line=dict(color="#666", width=2),
+            layer="below",
+        )
 
-    for j, jx in JX.items():
-        phase = phases[j]
-        ew_g  = (phase == "EW_GREEN")
-        ns_g  = (phase == "NS_GREEN")
-        q_ew  = int(min(pj.get(j, {}).get("ew", 0), 14))
-        q_ns  = int(min(pj.get(j, {}).get("ns", 0), 10))
+    # Vehicle markers from live simulation state.
+    vx, vy, vc, vs = [], [], [], []
+    for v in vehicles:
+        moving = bool(v.get("moving", False))
+        vx.append(v["x"])
+        vy.append(v.get("y", ROAD_CY - 8 if v["lane"] == "eb" else ROAD_CY + 8))
+        vc.append("#4ade80" if moving else "#ef4444")
+        vs.append("circle" if moving else "square")
 
-        # ── Queued EW — stack west of stop line ──
-        stop_x = jx - STOP_OFF - 3
-        min_x  = 10
-        for k in range(q_ew):
-            px = stop_x - k * VEH_GAP
-            if px >= min_x:
-                vx.append(px);  vy.append(ROAD_CY - 8)
-                vc.append("#50e090" if ew_g else "#e05050")
-                vsym.append("square")
-
-        # ── Queued NS — stack above stop line ──
-        stop_y = ROAD_CY - STOP_OFF - 3
-        for k in range(q_ns):
-            py = stop_y - k * VEH_GAP
-            if py >= 8:
-                vx.append(jx + 6);  vy.append(py)
-                vc.append("#50e090" if ns_g else "#e05050")
-                vsym.append("square")
-
-        # ── Free-flow EW (eastbound top lane) ──
-        # Vehicles wrap around the full canvas width.
-        # Each junction contributes 3 vehicles staggered 200px apart.
-        # A vehicle is hidden only if it is directly upstream of a RED stop line
-        # (within the last 30px before the stop) — avoid appearing to run red lights.
-        j_off  = {"J0": 0, "J1": 200, "J2": 400}[j]
-        for k in range(3):
-            px = (sim_t * 20 + k * 200 + j_off) % (CW + 60) - 30
-            if 0 < px < CW:
-                # Hide only if inside stop-line buffer at a RED junction
-                at_red = any(
-                    jx2 - STOP_OFF - 28 < px < jx2 - STOP_OFF + 5
-                    and phases[j2] != "EW_GREEN"
-                    for j2, jx2 in JX.items()
-                )
-                if not at_red:
-                    vx.append(px);  vy.append(ROAD_CY - 8)
-                    vc.append("#50e090");  vsym.append("circle")
-
-        # ── Free-flow WB (westbound bottom lane) ──
-        j_off_wb = {"J0": 0, "J1": 200, "J2": 400}[j]
-        for k in range(2):
-            px = CW - ((sim_t * 16 + k * 220 + j_off_wb) % (CW + 60)) + 30
-            if 0 < px < CW:
-                vx.append(px);  vy.append(ROAD_CY + 8)
-                vc.append("#50e090");  vsym.append("circle")
-
-        # ── Free-flow NS (northbound, right lane) ──
-        for k in range(2):
-            py = CH - ((sim_t * 13 + k * 130 + {"J0":0,"J1":50,"J2":100}[j]) % (CH + 40)) + 20
-            if ROAD_CY + ROAD_H < py < CH - 5:
-                vx.append(jx - 6);  vy.append(py)
-                vc.append("#50e090");  vsym.append("circle")
-
-    # ── Ambulance ─────────────────────────────────────────────────────────────
-    if amb.get("active"):
-        ax = amb_to_x(amb.get("pos_m", 0))
-        if -10 < ax < CW + 10:
-            flash = (sim_t % 2 == 0)
-            vx.append(ax);  vy.append(ROAD_CY - 8)
-            vc.append("#ef4444" if flash else "#ffffff")
-            vsym.append("diamond")
-
-    # Render all vehicles in a SINGLE scatter trace
     if vx:
-        fig.add_trace(go.Scatter(
-            x=vx, y=vy, mode="markers",
-            marker=dict(color=vc, size=VEH_SZ, symbol=vsym,
-                        line=dict(color="rgba(0,0,0,0.53)", width=0.8)),
-            showlegend=False, hoverinfo="skip",
-        ))
+        fig.add_trace(
+            go.Scatter(
+                x=vx,
+                y=vy,
+                mode="markers",
+                marker=dict(color=vc, size=VEH_SZ, symbol=vs, line=dict(color="rgba(0,0,0,0.55)", width=0.8)),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
 
-    # ── Signal heads ──────────────────────────────────────────────────────────
-    # Two dots per junction: one for EW approach, one for NS approach
+    # Ambulance
+    if amb.get("active"):
+        flash = snapshot.get("t", 0) % 2 == 0
+        fig.add_trace(
+            go.Scatter(
+                x=[amb.get("pos_x", -65.0)],
+                y=[ROAD_CY - 8],
+                mode="markers",
+                marker=dict(
+                    color="#ffffff" if flash else "#ef4444",
+                    size=14,
+                    symbol="diamond",
+                    line=dict(color="#ef4444", width=1.5),
+                ),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+
+    # Signal heads: 4 per junction (clearer than 2-dot view).
     sx, sy, sc = [], [], []
     for j, jx in JX.items():
-        phase      = phases[j]
+        phase = per_j.get(j, {}).get("phase", "ALL_RED")
         ew_c, ns_c = PHASE_SIG.get(phase, ("#ef4444", "#ef4444"))
-        # EW signal: left of stop line, road centre height
-        sx.append(jx - STOP_OFF - 10);  sy.append(ROAD_CY - ROAD_H - 10);  sc.append(ew_c)
-        # NS signal: right of NS road, above intersection
-        sx.append(jx + NS_W + 10);       sy.append(ROAD_CY - STOP_OFF - 8);  sc.append(ns_c)
 
-    fig.add_trace(go.Scatter(
-        x=sx, y=sy, mode="markers",
-        marker=dict(color=sc, size=12, symbol="circle",
-                    line=dict(color="#000", width=1.5)),
-        showlegend=False, hoverinfo="skip",
-    ))
+        # EW heads (west/east)
+        sx += [jx - STOP_OFF - 10, jx + STOP_OFF + 10]
+        sy += [ROAD_CY - ROAD_H - 10, ROAD_CY + ROAD_H + 10]
+        sc += [ew_c, ew_c]
 
-    # ── PCS highlight (emergency only) ────────────────────────────────────────
-    if amb.get("active"):
-        ax_now = amb_to_x(amb.get("pos_m", 0))
-        for j, jx in JX.items():
-            if abs(jx - ax_now) < 220:
-                fig.add_shape(type="rect",
-                              x0=jx-NS_W-5, x1=jx+NS_W+5,
-                              y0=ROAD_CY-ROAD_H-5, y1=ROAD_CY+ROAD_H+5,
-                              fillcolor="rgba(0,0,0,0)",
-                              line=dict(color="#f59e0b", width=2, dash="dot"),
-                              layer="below")
-                fig.add_annotation(x=jx, y=ROAD_CY-ROAD_H-18, text="PCS",
-                                   showarrow=False,
-                                   font=dict(color="#f59e0b", size=9, family="monospace"))
+        # NS heads (north/south)
+        sx += [jx - NS_W - 10, jx + NS_W + 10]
+        sy += [ROAD_CY - STOP_OFF - 10, ROAD_CY + STOP_OFF + 10]
+        sc += [ns_c, ns_c]
 
-    # ── Labels & overlays ─────────────────────────────────────────────────────
+    fig.add_trace(
+        go.Scatter(
+            x=sx,
+            y=sy,
+            mode="markers",
+            marker=dict(color=sc, size=10, symbol="circle", line=dict(color="#000", width=1.4)),
+            showlegend=False,
+            hoverinfo="skip",
+        )
+    )
+
+    # Labels
     for j, jx in JX.items():
-        fig.add_annotation(x=jx, y=8, text=j, showarrow=False,
-                           font=dict(color="#445", size=10, family="monospace"))
+        fig.add_annotation(x=jx, y=8, text=j, showarrow=False, font=dict(color="#445", size=10, family="monospace"))
 
-    fig.add_annotation(x=8, y=CH-8, text=f"t={sim_t}s",
-                       showarrow=False, xanchor="left",
-                       font=dict(color="#555", size=10, family="monospace"))
-    fig.add_annotation(x=8, y=CH-20,
-                       text=f"queued: {sd.get('total_halted',0)}",
-                       showarrow=False, xanchor="left",
-                       font=dict(color="#555", size=10, family="monospace"))
+    fig.add_annotation(
+        x=8,
+        y=CH - 8,
+        text=f"t={snapshot.get('t', 0)}s",
+        showarrow=False,
+        xanchor="left",
+        font=dict(color="#777", size=10, family="monospace"),
+    )
+    fig.add_annotation(
+        x=8,
+        y=CH - 20,
+        text=f"queued={snapshot.get('total_halted', 0)}",
+        showarrow=False,
+        xanchor="left",
+        font=dict(color="#777", size=10, family="monospace"),
+    )
+
     if amb.get("active"):
-        fig.add_annotation(x=CW/2, y=CH-8, text="⚠ EMERGENCY VEHICLE ACTIVE",
-                           showarrow=False,
-                           font=dict(color="#ef4444", size=11, family="monospace"))
+        fig.add_annotation(
+            x=CW / 2,
+            y=CH - 8,
+            text="EMERGENCY ACTIVE",
+            showarrow=False,
+            font=dict(color="#ef4444", size=11, family="monospace"),
+        )
 
     fig.update_layout(
-        paper_bgcolor=BG, plot_bgcolor=BG,
+        paper_bgcolor=bg,
+        plot_bgcolor=bg,
         xaxis=dict(visible=False, range=[0, CW], fixedrange=True),
         yaxis=dict(visible=False, range=[0, CH], fixedrange=True),
         height=280,
@@ -405,213 +1031,385 @@ def draw_animation(sd: dict, sim_t: int) -> go.Figure:
     return fig
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CHART: LIVE (current mode only)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def chart_live_queue(hist_t: list, hist_h: list, mode: str) -> go.Figure:
-    """
-    Single-mode live queue chart — grows from history buffer.
-    Shows ONLY the current simulation run.  Not a comparison.
-    """
+def chart_live_queue(history: dict, mode: str) -> go.Figure:
     fig = go.Figure()
-    if hist_t:
-        col = MODE_CFG[mode]["color"]
-        fig.add_trace(go.Scatter(
-            x=hist_t, y=hist_h,
-            name=MODE_CFG[mode]["label"],
-            line=dict(color=col, width=2.5),
-            fill="tozeroy", fillcolor=col.replace("#", "rgba(").replace(")", ",0.08)") + ")"
-            if False else "rgba(88,166,255,0.07)",
-        ))
-    dl = {**DARK, "xaxis": {**DARK["xaxis"], "range": [0, SIM_LIMIT]},
-          "yaxis": {**DARK["yaxis"], "rangemode": "tozero"}}
-    fig.update_layout(**dl,
-                      title=f"Live Queue — {MODE_CFG[mode]['label']}",
-                      xaxis_title="Sim Time (s)", yaxis_title="Vehicles Halted",
-                      height=220, showlegend=False)
+    t = history["time"]
+    q = history["queue_length"]
+
+    if t:
+        fig.add_trace(
+            go.Scatter(
+                x=t,
+                y=q,
+                name=MODE_CFG[mode]["label"],
+                line=dict(color=MODE_CFG[mode]["color"], width=2.5),
+                fill="tozeroy",
+                fillcolor="rgba(88,166,255,0.10)",
+            )
+        )
+
+    dl = {
+        **DARK,
+        "xaxis": {**DARK["xaxis"], "range": [0, SIM_DURATION_DEFAULT]},
+        "yaxis": {**DARK["yaxis"], "rangemode": "tozero"},
+    }
+    fig.update_layout(
+        **dl,
+        title=f"Live Queue — {MODE_CFG[mode]['label']}",
+        xaxis_title="Sim Time (s)",
+        yaxis_title="Vehicles Halted",
+        height=220,
+        showlegend=False,
+    )
     return fig
 
 
-def chart_live_perjunction(steps: list, cur_t: int) -> go.Figure:
-    """Per-junction breakdown growing to cur_t."""
-    sub = [s for s in steps if s["t"] <= cur_t]
+def chart_live_perjunction(history: dict) -> go.Figure:
     fig = go.Figure()
-    if sub:
-        t_    = [s["t"] for s in sub]
-        cols  = ["#58a6ff", "#56d364", "#f0a500"]
+    t = history["time"]
+    cols = ["#58a6ff", "#56d364", "#f0a500"]
+
+    if t:
         for i, j in enumerate(JUNCTIONS):
-            vals = [s["per_j"].get(j, {}).get("ew", 0)
-                    + s["per_j"].get(j, {}).get("ns", 0) for s in sub]
-            vals = pd.Series(vals).rolling(3, min_periods=1).mean().tolist()
-            fig.add_trace(go.Scatter(x=t_, y=vals, name=j,
-                                     line=dict(color=cols[i], width=2)))
-    dl = {**DARK, "xaxis": {**DARK["xaxis"], "range": [0, SIM_LIMIT]},
-          "yaxis": {**DARK["yaxis"], "rangemode": "tozero"}}
-    fig.update_layout(**dl, title="Queue per Junction",
-                      xaxis_title="Time (s)", yaxis_title="Halted", height=200)
+            fig.add_trace(
+                go.Scatter(
+                    x=t,
+                    y=history["per_j_total"][j],
+                    name=j,
+                    line=dict(color=cols[i], width=2),
+                )
+            )
+
+    dl = {
+        **DARK,
+        "xaxis": {**DARK["xaxis"], "range": [0, SIM_DURATION_DEFAULT]},
+        "yaxis": {**DARK["yaxis"], "rangemode": "tozero"},
+    }
+    fig.update_layout(
+        **dl,
+        title="Queue per Junction",
+        xaxis_title="Time (s)",
+        yaxis_title="Vehicles",
+        height=220,
+    )
     return fig
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CHART: COMPARISON (expander only)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def chart_compare(base_steps: list, adapt_steps: list, cur_t: int) -> go.Figure:
-    """Fixed vs adaptive, sliced to cur_t — shown in comparison expander."""
-    bs = [s for s in base_steps  if s["t"] <= cur_t]
-    as_ = [s for s in adapt_steps if s["t"] <= cur_t]
+def chart_compare_avg_delay(fixed_run: dict, adaptive_run: dict) -> go.Figure:
     fig = go.Figure()
-    if bs:
-        fig.add_trace(go.Scatter(
-            x=[s["t"] for s in bs], y=[s["total_halted"] for s in bs],
-            name="Fixed-Time Baseline", line=dict(color="#f85149", width=2)))
-    if as_:
-        fig.add_trace(go.Scatter(
-            x=[s["t"] for s in as_], y=[s["total_halted"] for s in as_],
-            name="FlowSense Adaptive", line=dict(color="#58a6ff", width=2),
-            fill="tozeroy", fillcolor="rgba(88,166,255,0.07)"))
-    dl = {**DARK, "xaxis": {**DARK["xaxis"], "range": [0, SIM_LIMIT]}}
-    fig.update_layout(**dl, title="Fixed vs Adaptive (to current time)",
-                      xaxis_title="Sim Time (s)", yaxis_title="Halted",
-                      height=240)
+    fig.add_trace(
+        go.Scatter(
+            x=fixed_run["time"],
+            y=fixed_run["avg_delay"],
+            name="Fixed Timing",
+            line=dict(color=MODE_CFG["fixed"]["color"], width=2.3),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=adaptive_run["time"],
+            y=adaptive_run["avg_delay"],
+            name="Adaptive Timing",
+            line=dict(color=MODE_CFG["adaptive"]["color"], width=2.3),
+        )
+    )
+    dl = {
+        **DARK,
+        "xaxis": {**DARK["xaxis"], "range": [0, SIM_DURATION_DEFAULT]},
+        "yaxis": {**DARK["yaxis"], "rangemode": "tozero"},
+    }
+    fig.update_layout(**dl, title="Fixed vs Adaptive — Average Delay", xaxis_title="Sim Time (s)", yaxis_title="Avg Delay (s)", height=240)
     return fig
 
 
-def chart_ambulance_bar(nopcs: dict, pcs: dict) -> go.Figure:
-    """Simple ambulance travel time comparison bar."""
-    ne = nopcs.get("ambulance_enter_t", 120)
-    nt = nopcs.get("ambulance_travel_s", 186)
-    pt = pcs.get("ambulance_travel_s",   89)
-    ns = nopcs.get("ambulance_stops",    4)
-    ps = pcs.get("ambulance_stops",      0)
+def chart_compare_queue(fixed_run: dict, adaptive_run: dict) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(go.Bar(y=["Without PCS"], x=[nt], base=[ne],
-                         orientation="h", marker_color="#f85149",
-                         name=f"No PCS — {ns} stops, {nt}s",
-                         text=f"  {nt}s | {ns} stops",
-                         textposition="inside", insidetextanchor="start"))
-    fig.add_trace(go.Bar(y=["With PCS"],    x=[pt], base=[ne],
-                         orientation="h", marker_color="#56d364",
-                         name=f"PCS — {ps} stops, {pt}s",
-                         text=f"  {pt}s | 0 stops",
-                         textposition="inside", insidetextanchor="start"))
-    fig.add_vline(x=ne, line_dash="dash", line_color="#f0a500",
-                  annotation_text="🚑 Dispatched",
-                  annotation_position="top right")
-    dl = {**DARK, "legend": dict(orientation="h", y=-0.35, bgcolor="rgba(0,0,0,0)")}
-    fig.update_layout(**dl, title="Ambulance Travel Time",
-                      xaxis_title="Simulation Time (s)", barmode="overlay", height=180)
+    fig.add_trace(
+        go.Scatter(
+            x=fixed_run["time"],
+            y=fixed_run["queue_length"],
+            name="Fixed Timing",
+            line=dict(color=MODE_CFG["fixed"]["color"], width=2.3),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=adaptive_run["time"],
+            y=adaptive_run["queue_length"],
+            name="Adaptive Timing",
+            line=dict(color=MODE_CFG["adaptive"]["color"], width=2.3),
+        )
+    )
+    dl = {
+        **DARK,
+        "xaxis": {**DARK["xaxis"], "range": [0, SIM_DURATION_DEFAULT]},
+        "yaxis": {**DARK["yaxis"], "rangemode": "tozero"},
+    }
+    fig.update_layout(**dl, title="Fixed vs Adaptive — Queue Length", xaxis_title="Sim Time (s)", yaxis_title="Halted Vehicles", height=240)
     return fig
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# KPI CARD
-# ──────────────────────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def load_video_state_profile(path_str: str, mtime: float, max_points: int = 240):
+    _ = mtime  # cache invalidation key
+    path = Path(path_str)
+    if not path.exists():
+        return None
 
-def kpi(label: str, val, delta: str = "", col: str = "#58a6ff") -> str:
-    delta_html = f"<div class='kpi-delta'>{delta}</div>" if delta else ""
-    return (f"<div class='kpi-card'>"
-            f"<div class='kpi-val' style='color:{col}'>{val}</div>"
-            f"{delta_html}"
-            f"<div class='kpi-label'>{label}</div>"
-            f"</div>")
+    rows = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        rows.append(
+            {
+                "queue_length": float(d.get("queue_length", 0.0)),
+                "arrival_rate": float(d.get("arrival_rate", 0.0)),
+                "departure_rate": float(d.get("departure_rate", 0.0)),
+            }
+        )
+
+    if len(rows) < 20:
+        return None
+
+    q = np.array([r["queue_length"] for r in rows], dtype=float)
+    arr = np.array([r["arrival_rate"] for r in rows], dtype=float)
+    dep = np.array([r["departure_rate"] for r in rows], dtype=float)
+    q = np.clip(q, 0.0, None)
+    arr = np.clip(arr, 0.0, None)
+    dep = np.clip(dep, 0.0, None)
+
+    if len(q) > max_points:
+        idx = np.linspace(0, len(q) - 1, max_points).astype(int)
+        q = q[idx]
+        arr = arr[idx]
+        dep = dep[idx]
+
+    # Assume similar cross-street demand based on video EW activity.
+    ns_arr = np.clip(0.55 * arr + 0.20 * np.sqrt(q + 1.0), 0.05, None)
+    t = np.arange(len(q), dtype=int)
+
+    return {
+        "time": t.tolist(),
+        "queue_video": q.tolist(),
+        "arr_ew": arr.tolist(),
+        "arr_ns_assumed": ns_arr.tolist(),
+        "dep_video": dep.tolist(),
+    }
+
+
+def _simulate_single_intersection(arr_ew: list, arr_ns: list, mode: str):
+    q_ew = 0.0
+    q_ns = 0.0
+    phase = "EW_GREEN"
+    last_green = "EW_GREEN"
+    time_in_phase = 0
+
+    sat_ew = 1.85
+    sat_ns = 1.35
+    min_green = 10
+    max_green = 50
+    hysteresis = 2.5
+
+    out_q = []
+    out_delay = []
+    out_thr = []
+    out_phase = []
+    throughput = 0.0
+    cumulative_wait = 0.0
+
+    for t in range(len(arr_ew)):
+        a_ew = max(0.0, float(arr_ew[t]))
+        a_ns = max(0.0, float(arr_ns[t]))
+        q_ew += a_ew
+        q_ns += a_ns
+        time_in_phase += 1
+
+        if mode == "fixed":
+            c = t % 66
+            if c < 28:
+                phase = "EW_GREEN"
+            elif c < 31:
+                phase = "EW_YELLOW"
+            elif c < 32:
+                phase = "ALL_RED"
+            elif c < 60:
+                phase = "NS_GREEN"
+            elif c < 63:
+                phase = "NS_YELLOW"
+            else:
+                phase = "ALL_RED"
+        else:
+            if phase in ("EW_YELLOW", "NS_YELLOW"):
+                if time_in_phase >= YELLOW:
+                    phase = "ALL_RED"
+                    time_in_phase = 0
+            elif phase == "ALL_RED":
+                if time_in_phase >= ALL_RED:
+                    phase = "NS_GREEN" if last_green == "EW_GREEN" else "EW_GREEN"
+                    time_in_phase = 0
+            else:
+                p_ew = q_ew + 2.5 * a_ew
+                p_ns = q_ns + 2.5 * a_ns
+                switch = False
+                if time_in_phase >= min_green:
+                    if phase == "EW_GREEN" and p_ns > p_ew + hysteresis:
+                        switch = True
+                    elif phase == "NS_GREEN" and p_ew > p_ns + hysteresis:
+                        switch = True
+                    active_q = q_ew if phase == "EW_GREEN" else q_ns
+                    opp_q = q_ns if phase == "EW_GREEN" else q_ew
+                    if active_q >= 7 and opp_q <= active_q + 3 and time_in_phase < int(max_green * 0.85):
+                        switch = False
+                if time_in_phase >= max_green:
+                    switch = True
+                if switch:
+                    last_green = phase
+                    phase = "EW_YELLOW" if phase == "EW_GREEN" else "NS_YELLOW"
+                    time_in_phase = 0
+
+        d_ew = 0.0
+        d_ns = 0.0
+        if phase == "EW_GREEN":
+            d_ew = min(q_ew, sat_ew)
+            q_ew -= d_ew
+        elif phase == "NS_GREEN":
+            d_ns = min(q_ns, sat_ns)
+            q_ns -= d_ns
+
+        throughput += d_ew + d_ns
+        cumulative_wait += (q_ew + q_ns)
+
+        out_q.append(max(0.0, q_ew + q_ns))
+        out_delay.append(cumulative_wait / max(1.0, throughput))
+        out_thr.append(throughput)
+        out_phase.append(phase)
+
+    return {
+        "queue": out_q,
+        "avg_delay": out_delay,
+        "throughput": out_thr,
+        "phase": out_phase,
+        "final_queue": out_q[-1] if out_q else 0.0,
+        "final_delay": out_delay[-1] if out_delay else 0.0,
+        "final_throughput": out_thr[-1] if out_thr else 0.0,
+    }
+
+
+@st.cache_data(show_spinner=False)
+def compute_video_static_benchmark(path_str: str, mtime: float):
+    profile = load_video_state_profile(path_str, mtime)
+    if profile is None:
+        return None
+    fixed = _simulate_single_intersection(profile["arr_ew"], profile["arr_ns_assumed"], mode="fixed")
+    adaptive = _simulate_single_intersection(profile["arr_ew"], profile["arr_ns_assumed"], mode="adaptive")
+    return {"profile": profile, "fixed": fixed, "adaptive": adaptive}
+
+
+def chart_video_static_compare(time_vals: list, fixed_vals: list, adaptive_vals: list, title: str, y_title: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=time_vals,
+            y=fixed_vals,
+            name="Fixed Signal",
+            line=dict(color=MODE_CFG["fixed"]["color"], width=2.2),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=time_vals,
+            y=adaptive_vals,
+            name="Our Solution (Adaptive)",
+            line=dict(color=MODE_CFG["adaptive"]["color"], width=2.2),
+        )
+    )
+    dl = {
+        **DARK,
+        "xaxis": {**DARK["xaxis"], "range": [0, max(time_vals) if time_vals else 0]},
+        "yaxis": {**DARK["yaxis"], "rangemode": "tozero"},
+    }
+    fig.update_layout(**dl, title=title, xaxis_title="Video-Derived Time (s)", yaxis_title=y_title, height=235)
+    return fig
+
+
+def _record_completed_run_if_needed(sim: dict):
+    if sim["mode"] not in ("fixed", "adaptive"):
+        return
+    if not sim["completed"] or sim.get("recorded"):
+        return
+
+    if "completed_runs" not in st.session_state:
+        st.session_state.completed_runs = {"fixed": [], "adaptive": []}
+
+    h = sim["metrics_history"]
+    rec = {
+        "time": list(h["time"]),
+        "avg_delay": list(h["avg_delay"]),
+        "queue_length": list(h["queue_length"]),
+        "throughput": list(h["throughput"]),
+        "avg_stops": list(h["avg_stops"]),
+    }
+    st.session_state.completed_runs[sim["mode"]].append(rec)
+    sim["recorded"] = True
+    st.session_state.running = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _reset():
-    st.session_state.hist_t      = []
-    st.session_state.hist_halted = []
-    st.session_state.hist_mode   = None
-    st.session_state.step        = 0
-    st.session_state.running     = True
-
-
 def main():
-    # ── Session state ─────────────────────────────────────────────────────────
-    for k, v in [("step", 0), ("running", True), ("ui_mode", "adaptive"),
-                 ("sim_speed", 1), ("hist_t", []), ("hist_halted", []),
-                 ("hist_mode", None)]:
+    for k, v in [("ui_mode", "adaptive"), ("running", True), ("sim_speed", 1)]:
         if k not in st.session_state:
             st.session_state[k] = v
+    if "completed_runs" not in st.session_state:
+        st.session_state.completed_runs = {"fixed": [], "adaptive": []}
 
-    data, is_live = load_results()
+    if "sim" not in st.session_state:
+        st.session_state.sim = _new_sim(st.session_state.ui_mode)
 
-    # ── Resolve current frame ─────────────────────────────────────────────────
-    ui_mode  = st.session_state.ui_mode
-    rkey     = MODE_CFG[ui_mode]["key"]
-    steps    = data[rkey]["steps"][:SIM_LIMIT]
-    cur_step = min(int(st.session_state.step), len(steps) - 1)
-    sd       = steps[cur_step]
+    # Keep simulation mode isolated from UI mode.
+    if st.session_state.sim["mode"] != st.session_state.ui_mode:
+        _reset_sim(st.session_state.ui_mode)
 
-    # ── History buffer ────────────────────────────────────────────────────────
-    if st.session_state.hist_mode != ui_mode:
-        st.session_state.hist_mode    = ui_mode
-        st.session_state.hist_t       = []
-        st.session_state.hist_halted  = []
+    sim = st.session_state.sim
+    _record_completed_run_if_needed(sim)
+    if sim["completed"] and st.session_state.running:
+        st.session_state.running = False
+    snapshot = sim["snapshot"]
+    metrics = latest_metrics(sim)
 
-    hist_t = st.session_state.hist_t
-    hist_h = st.session_state.hist_halted
-    # Append current frame (avoid duplicate on same step)
-    if not hist_t or hist_t[-1] != cur_step:
-        hist_t.append(cur_step)
-        hist_h.append(sd["total_halted"])
-        st.session_state.hist_t      = hist_t
-        st.session_state.hist_halted = hist_h
-
-    # ── Live metric derivation ────────────────────────────────────────────────
-    ARRIVAL_RATE = 1.5    # veh/s estimated from state_log (3 junctions total)
-    throughput   = 0
-    stops_est    = 0
-    if len(hist_h) > 1:
-        for i in range(1, len(hist_h)):
-            discharged    = max(0.0, hist_h[i-1] - hist_h[i] + ARRIVAL_RATE)
-            throughput   += discharged
-            # Estimate stops: a red-to-green transition causes stops
-            # Proxy: each frame where queue grew counts as vehicles stopping
-            stops_est    += max(0, hist_h[i] - hist_h[i-1])
-    throughput = int(throughput)
-    stops_est  = int(stops_est)
-    avg_q      = sum(hist_h) / len(hist_h) if hist_h else 0
-    # Avg delay: Little's Law proxy — avg_queue / arrival_rate
-    avg_delay  = avg_q / ARRIVAL_RATE if ARRIVAL_RATE > 0 else 0
-
-    total_q = sd.get("total_halted", 0)
-    prev_q  = hist_h[-2] if len(hist_h) >= 2 else total_q
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # LAYOUT START
-    # ──────────────────────────────────────────────────────────────────────────
-
-    # ── Header ────────────────────────────────────────────────────────────────
+    # Header
     h1, h2 = st.columns([2, 1])
     with h1:
         st.markdown(
             "<h1 style='margin:0;font-size:1.7rem'>🚦 FlowSense</h1>"
             "<div style='color:#8b949e;font-size:.85rem;margin-top:2px'>"
-            "AI-Driven Adaptive Traffic &amp; Emergency Corridor — Live Simulation"
-            "</div>", unsafe_allow_html=True)
+            "True Live Stochastic Simulation — Session-State Driven"
+            "</div>",
+            unsafe_allow_html=True,
+        )
     with h2:
-        src_label = "🟢 Video-Derived State" if is_live else "🟡 Demo Mode"
-        st.caption(f"{src_label} &nbsp;|&nbsp; India Innovates 2026 — Team HighKey Trophy")
+        st.caption("🟢 Live Engine &nbsp;|&nbsp; No precomputed replay")
 
-    # ── Mode selector + controls (compact row) ────────────────────────────────
-    mc1, mc2, mc3, mc4, mc5, mc6, mc7 = st.columns([2, 2, 2, 0.6, 0.6, 1.5, 1.5])
+    # Controls
+    mc1, mc2, mc3, mc4, mc5, mc6, mc7 = st.columns([2, 2, 2, 0.7, 0.7, 1.5, 1.5])
+
     for col_, key in zip([mc1, mc2, mc3], ["fixed", "adaptive", "emergency"]):
         with col_:
-            active = (ui_mode == key)
-            cfg    = MODE_CFG[key]
-            border = f"2px solid {cfg['color']}" if active else "1px solid #30363d"
-            bg     = "#1a1f28" if active else "#0d1117"
-            if st.button(
-                ("✓ " if active else "") + cfg["label"],
-                key=f"m_{key}", use_container_width=True
-            ):
+            active = st.session_state.ui_mode == key
+            cfg = MODE_CFG[key]
+            if st.button(("✓ " if active else "") + cfg["label"], key=f"m_{key}", use_container_width=True):
                 st.session_state.ui_mode = key
-                _reset()
+                _reset_sim(key)
+                sim = st.session_state.sim
+                snapshot = sim["snapshot"]
+                metrics = latest_metrics(sim)
+
     with mc4:
         if st.session_state.running:
             if st.button("⏸", use_container_width=True):
@@ -619,205 +1417,262 @@ def main():
         else:
             if st.button("▶", use_container_width=True):
                 st.session_state.running = True
+
     with mc5:
         if st.button("⏮", use_container_width=True):
-            _reset()
+            _reset_sim(st.session_state.ui_mode)
+            sim = st.session_state.sim
+            snapshot = sim["snapshot"]
+            metrics = latest_metrics(sim)
+
     with mc6:
-        spd = st.select_slider("Speed", options=[1, 2, 3, 5],
-                                value=st.session_state.sim_speed,
-                                label_visibility="collapsed")
+        spd = st.select_slider("Speed", options=[1, 2, 3, 5], value=st.session_state.sim_speed, label_visibility="collapsed")
         st.session_state.sim_speed = spd
     with mc7:
-        st.caption(f"Speed ×{spd} &nbsp;|&nbsp; {'▶ Running' if st.session_state.running else '⏸ Paused'}")
+        status = "▶ Running" if st.session_state.running else "⏸ Paused"
+        st.caption(f"Speed ×{st.session_state.sim_speed} &nbsp;|&nbsp; {status}")
 
     st.divider()
 
-    # ── KPI row ───────────────────────────────────────────────────────────────
+    # KPIs (all from current run state/history)
     k1, k2, k3, k4, k5, k6 = st.columns(6)
-    delta_q  = f"{total_q - prev_q:+d}" if total_q != prev_q else ""
-    with k1:
-        st.markdown(kpi("Sim Time",       f"{cur_step}s",
-                        f"{cur_step}/{SIM_LIMIT}s"), unsafe_allow_html=True)
-    with k2:
-        st.markdown(kpi("Vehicles Halted", total_q,
-                        delta_q, col="#f85149" if total_q > avg_q else "#56d364"),
-                    unsafe_allow_html=True)
-    with k3:
-        st.markdown(kpi("Throughput",      f"~{throughput}",
-                        "veh served"), unsafe_allow_html=True)
-    with k4:
-        st.markdown(kpi("Avg Delay",       f"{avg_delay:.1f}s",
-                        "Little's Law"), unsafe_allow_html=True)
-    with k5:
-        st.markdown(kpi("Avg Queue",       f"{avg_q:.1f}",
-                        "veh halted"), unsafe_allow_html=True)
-    with k6:
-        mode_col = MODE_CFG[ui_mode]["color"]
-        st.markdown(kpi("Mode", MODE_CFG[ui_mode]["label"][:9],
-                        col=mode_col), unsafe_allow_html=True)
+    q_hist = sim["metrics_history"]["queue_length"]
+    prev_q = q_hist[-2] if len(q_hist) >= 2 else metrics["queue_length"]
+    delta_q = metrics["queue_length"] - prev_q
+    delta_q_str = f"{delta_q:+d}" if delta_q else ""
 
-    # ── Main: animation | signal panel ───────────────────────────────────────
+    with k1:
+        st.markdown(
+            kpi("Sim Time", f"{metrics['sim_time']}s", f"{metrics['sim_time']}/{sim['duration']}s"),
+            unsafe_allow_html=True,
+        )
+    with k2:
+        st.markdown(
+            kpi("Queue Length", metrics["queue_length"], delta_q_str, col="#f85149" if metrics["queue_length"] > 0 else "#56d364"),
+            unsafe_allow_html=True,
+        )
+    with k3:
+        st.markdown(kpi("Throughput", metrics["throughput"], "served"), unsafe_allow_html=True)
+    with k4:
+        st.markdown(kpi("Avg Delay", f"{metrics['avg_delay']:.1f}s", "live"), unsafe_allow_html=True)
+    with k5:
+        st.markdown(kpi("Avg Stops", f"{metrics['avg_stops']:.2f}", "per vehicle"), unsafe_allow_html=True)
+    with k6:
+        st.markdown(kpi("Active Vehicles", metrics["active_vehicles"], col=MODE_CFG[st.session_state.ui_mode]["color"]), unsafe_allow_html=True)
+
+    # Main panels
     col_anim, col_sig = st.columns([3, 1])
 
     with col_anim:
-        mode_col = MODE_CFG[ui_mode]["color"]
+        mode_col = MODE_CFG[st.session_state.ui_mode]["color"]
         st.markdown(
             f"<div style='font-weight:700;color:{mode_col};margin-bottom:4px'>"
-            f"● {MODE_CFG[ui_mode]['label']} — t={cur_step}s</div>",
-            unsafe_allow_html=True)
-        st.plotly_chart(draw_animation(sd, cur_step),
-                        use_container_width=True,
-                        config={"displayModeBar": False, "staticPlot": True})
+            f"● {MODE_CFG[st.session_state.ui_mode]['label']} — t={snapshot['t']}s</div>",
+            unsafe_allow_html=True,
+        )
+        st.plotly_chart(draw_animation(snapshot), use_container_width=True, config={"displayModeBar": False, "staticPlot": True})
 
     with col_sig:
         st.markdown("**Signal States**")
-        phases = phases_of(sd)
         for j in JUNCTIONS:
-            ph   = phases[j]
-            _pj  = sd.get("per_j", {})
-            q_ew = _pj.get(j, {}).get("ew", 0)
-            q_ns = _pj.get(j, {}).get("ns", 0)
+            pj = snapshot["per_j"][j]
+            ph = pj["phase"]
             ew_c, ns_c = PHASE_SIG.get(ph, ("#ef4444", "#ef4444"))
-            ph_label   = ph.replace("_", " ")
-            ew_dot = f"<span style='color:{ew_c}'>●</span> EW"
-            ns_dot = f"<span style='color:{ns_c}'>●</span> NS"
             st.markdown(
                 f"<div class='sig-card'>"
-                f"<b style='color:#aaa'>{j}</b> &nbsp;{ew_dot} {ns_dot}<br>"
-                f"<span style='color:#444;font-size:.72rem'>"
-                f"ew={q_ew} ns={q_ns} &nbsp; <i>{ph_label}</i>"
+                f"<b style='color:#aaa'>{j}</b> &nbsp;"
+                f"<span style='color:{ew_c}'>●</span> EW "
+                f"<span style='color:{ns_c}'>●</span> NS<br>"
+                f"<span style='color:#666;font-size:.72rem'>"
+                f"ew={pj['ew']} ns={pj['ns']} &nbsp; <i>{ph}</i>"
                 f"</span></div>",
-                unsafe_allow_html=True)
+                unsafe_allow_html=True,
+            )
 
-        # Emergency vehicle status
-        if ui_mode == "emergency":
-            amb = sd.get("amb", {})
+        if st.session_state.ui_mode == "emergency":
+            amb = snapshot["amb"]
             st.markdown("---")
             st.markdown("**Emergency**")
-            if not amb.get("active") and cur_step < 120:
-                st.info(f"🚑 T-{120-cur_step}s to dispatch")
-            elif amb.get("active"):
-                pct = max(0, min(1.0,
-                    (amb.get("pos_m", 0) - AMB_ENTRY_M) / (2 * AMB_SPACING_M)))
-                st.warning(f"🚑 En route")
+            if not amb["active"] and amb.get("entered_t") is None:
+                rem = max(0, sim["ambulance"]["dispatch_t"] - snapshot["t"])
+                st.info(f"Dispatch in {rem}s")
+            elif amb["active"]:
+                pct = max(0.0, min(1.0, amb["pos_x"] / CW))
+                st.warning(f"Status: {amb['status']}")
                 st.progress(pct)
+                st.caption(f"Stops: {amb['stops']} | Delay: {amb['delay_s']:.0f}s")
             else:
-                st.success(f"🏥 Arrived")
+                st.success("Ambulance arrived")
 
-        # Progress bar
         st.markdown("---")
-        st.progress(min(1.0, cur_step / max(1, SIM_LIMIT - 1)),
-                    text=f"{cur_step}/{SIM_LIMIT}s")
+        st.progress(min(1.0, snapshot["t"] / max(1, sim["duration"])), text=f"{snapshot['t']}/{sim['duration']}s")
 
-    # ── Live charts (current mode only) ───────────────────────────────────────
+    # Live charts (current run only)
     lc1, lc2 = st.columns([3, 2])
     with lc1:
-        st.plotly_chart(chart_live_queue(hist_t, hist_h, ui_mode),
-                        use_container_width=True,
-                        config={"displayModeBar": False, "staticPlot": True})
+        st.plotly_chart(chart_live_queue(sim["metrics_history"], st.session_state.ui_mode), use_container_width=True, config={"displayModeBar": False, "staticPlot": True})
     with lc2:
-        st.plotly_chart(chart_live_perjunction(steps, cur_step),
-                        use_container_width=True,
-                        config={"displayModeBar": False, "staticPlot": True})
+        st.plotly_chart(chart_live_perjunction(sim["metrics_history"]), use_container_width=True, config={"displayModeBar": False, "staticPlot": True})
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # EXPANDERS (non-essential / reference sections)
-    # ──────────────────────────────────────────────────────────────────────────
+    with st.expander("Fixed vs Adaptive Comparison (completed live runs)"):
+        fixed_runs = st.session_state.completed_runs.get("fixed", [])
+        adaptive_runs = st.session_state.completed_runs.get("adaptive", [])
+        if fixed_runs and adaptive_runs:
+            fixed_run = fixed_runs[-1]
+            adaptive_run = adaptive_runs[-1]
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                st.plotly_chart(chart_compare_avg_delay(fixed_run, adaptive_run), use_container_width=True, config={"displayModeBar": False, "staticPlot": True})
+            with cc2:
+                st.plotly_chart(chart_compare_queue(fixed_run, adaptive_run), use_container_width=True, config={"displayModeBar": False, "staticPlot": True})
 
-    with st.expander("📊 Compare Modes — Fixed vs Adaptive"):
-        st.plotly_chart(
-            chart_compare(data["baseline"]["steps"][:SIM_LIMIT],
-                          data["adaptive"]["steps"][:SIM_LIMIT],
-                          cur_step),
-            use_container_width=True, config={"displayModeBar": False})
-        base_avg  = data["baseline"]["summary"]["avg_halted"]
-        adapt_avg = data["adaptive"]["summary"]["avg_halted"]
-        if base_avg > 0:
-            red = round((base_avg - adapt_avg) / base_avg * 100)
-            st.markdown(
-                f"**Adaptive reduces avg. queue by {red}%** "
-                f"({base_avg:.1f} → {adapt_avg:.1f} veh avg halted, full 600s run)")
+            fixed_final_delay = fixed_run["avg_delay"][-1] if fixed_run["avg_delay"] else 0.0
+            adaptive_final_delay = adaptive_run["avg_delay"][-1] if adaptive_run["avg_delay"] else 0.0
+            if fixed_final_delay > 0:
+                improvement = (fixed_final_delay - adaptive_final_delay) / fixed_final_delay * 100
+                st.caption(f"Latest completed runs: adaptive average-delay improvement = {improvement:.1f}%")
+        else:
+            st.caption("Run Fixed and Adaptive mode through one full simulation each to generate realtime comparison charts.")
 
-    if ui_mode == "emergency":
-        with st.expander("🚑 Emergency Corridor — PCS Detail", expanded=True):
-            nopcs_s = data["emergency_nopcs"]["summary"]
-            pcs_s   = data["emergency_pcs"]["summary"]
-            st.plotly_chart(chart_ambulance_bar(nopcs_s, pcs_s),
-                            use_container_width=True,
-                            config={"displayModeBar": False})
-            ne = pcs_s.get("ambulance_enter_t", 120)
-            ne1, ne2, ne3 = ne+7, ne+43, ne+79
-            st.markdown(
-                f"<div style='font-family:monospace;font-size:.8rem;line-height:1.9;"
-                f"background:#0d1117;border:1px solid #21262d;border-radius:8px;"
-                f"padding:12px'>"
-                f"<span style='color:#f0a500'>T={ne}s</span> 🚑 Dispatched<br>"
-                f"<span style='color:#58a6ff'>T={ne+1}s</span> ETAs: J0+{ne1-ne}s  J1+{ne2-ne}s  J2+{ne3-ne}s<br>"
-                f"<span style='color:#56d364'>T={ne2}s</span> 🚑 Passes J0 GREEN ✅<br>"
-                f"<span style='color:#56d364'>T={ne2}s</span> 🚑 Passes J1 GREEN ✅<br>"
-                f"<span style='color:#56d364'>T={ne3}s</span> 🚑 Passes J2 GREEN ✅<br>"
-                f"<span style='color:#56d364'>T={pcs_s.get('ambulance_exit_t',209)}s</span>"
-                f" 🏥 Arrived. Travel: <b>{pcs_s.get('ambulance_travel_s',89)}s</b>"
-                f"</div>",
-                unsafe_allow_html=True)
+    with st.expander("Simulation State Contract"):
+        st.code(
+            json.dumps(
+                {
+                    "sim": {
+                        "time": sim["time"],
+                        "mode": sim["mode"],
+                        "running": st.session_state.running,
+                        "duration": sim["duration"],
+                        "vehicles": len(sim["vehicles"]),
+                        "signals": {j: sim["signals"][j]["phase"] for j in JUNCTIONS},
+                        "queues": {j: {"ew": sim["queues"][j]["ew"], "ns": int(round(sim["queues"][j]["ns"]))} for j in JUNCTIONS},
+                        "throughput": sim["throughput"],
+                    }
+                },
+                indent=2,
+            ),
+            language="json",
+        )
 
-    with st.expander("🏗️ System Architecture"):
-        layers = [
-            ("Layer 1 — Edge CV",      "#58a6ff", "#0d1b2e",
-             "YOLOv8n detection + ByteTrack → queue_length, arrival_rate, departure_rate @ 1 Hz"),
-            ("Layer 2 — Adaptive Ctrl", "#f0a500", "#1e1500",
-             "pressure = queue + 5×arrival_rate + platoon_bias; MIN_GREEN=8s MAX_GREEN=45s"),
-            ("Layer 3 — PCS Emergency", "#56d364", "#0d1e0d",
-             "GPS dispatch → ETA per junction → reservation window (10s pre-clear + 6s guard)"),
-        ]
-        html = "<div style='display:flex;gap:10px;margin-top:6px'>"
-        for title, border, bg, desc in layers:
-            html += (f"<div style='flex:1;background:{bg};border:1.5px solid {border};"
-                     f"border-radius:8px;padding:12px'>"
-                     f"<div style='color:{border};font-weight:700;font-size:.85rem;"
-                     f"margin-bottom:5px'>{title}</div>"
-                     f"<div style='color:#8b949e;font-size:.78rem;line-height:1.6'>{desc}</div>"
-                     f"</div>")
-        html += "</div>"
-        st.markdown(html, unsafe_allow_html=True)
+    with st.expander("CV Layer Snapshot (reference only)"):
+        video_path = Path("output/detection.mp4")
+        if not video_path.exists():
+            video_path = Path("data/videos/traffic.mp4")
+        if video_path.exists() and video_path.stat().st_size > 1000:
+            st.video(str(video_path))
+            st.caption(f"Traffic video being analysed: {video_path}")
 
-    with st.expander("📹 CV Layer — Detection Sample"):
-        vp = Path("output/detection.mp4")
-        if vp.exists() and vp.stat().st_size > 1000:
-            st.video(str(vp))
-            st.caption("YOLOv8n + ByteTrack on real Delhi traffic footage")
         slp = Path("output/state_log.jsonl")
         if slp.exists():
-            with open(slp) as f:
-                lines = f.read().strip().splitlines()
-            last = json.loads(lines[-1])
-            st.code(json.dumps({
-                "intersection_id": "J0",
-                "timestamp":        last.get("timestamp"),
-                "queue_length":     last.get("queue_length", 0),
-                "arrival_rate":     last.get("arrival_rate", 0),
-                "signal_phase":     "EW_GREEN",
-            }, indent=2), language="json")
-            st.caption(f"{len(lines)} samples from video analysis")
+            lines = [ln for ln in slp.read_text().splitlines() if ln.strip()]
+            if lines:
+                last = json.loads(lines[-1])
+                st.code(
+                    json.dumps(
+                        {
+                            "intersection_id": "J0",
+                            "timestamp": last.get("timestamp"),
+                            "queue_length": last.get("queue_length", 0),
+                            "arrival_rate": last.get("arrival_rate", 0),
+                            "departure_rate": last.get("departure_rate", 0),
+                        },
+                        indent=2,
+                    ),
+                    language="json",
+                )
+                st.caption(f"{len(lines)} logged state samples")
+        else:
+            st.caption("No state_log.jsonl found.")
 
-    # ── Footer ────────────────────────────────────────────────────────────────
+    with st.expander("Video-Derived Static Benchmark (Single Intersection)"):
+        slp = Path("output/state_log.jsonl")
+        if not slp.exists():
+            st.caption("No video-derived state log found yet. Run the CV pipeline to generate `output/state_log.jsonl`.")
+        else:
+            bench = compute_video_static_benchmark(str(slp), slp.stat().st_mtime)
+            if bench is None:
+                st.caption("Insufficient samples in `output/state_log.jsonl` to build the benchmark.")
+            else:
+                prof = bench["profile"]
+                fixed_b = bench["fixed"]
+                adapt_b = bench["adaptive"]
+                t_vals = prof["time"]
+
+                k1, k2, k3, k4 = st.columns(4)
+                fq = fixed_b["final_queue"]
+                aq = adapt_b["final_queue"]
+                fd = fixed_b["final_delay"]
+                ad = adapt_b["final_delay"]
+                ft = fixed_b["final_throughput"]
+                at = adapt_b["final_throughput"]
+                q_imp = ((fq - aq) / fq * 100.0) if fq > 0 else 0.0
+                d_imp = ((fd - ad) / fd * 100.0) if fd > 0 else 0.0
+                t_imp = ((at - ft) / ft * 100.0) if ft > 0 else 0.0
+
+                with k1:
+                    st.markdown(kpi("Final Queue", f"{aq:.1f}", f"Adaptive {q_imp:.1f}% lower"), unsafe_allow_html=True)
+                with k2:
+                    st.markdown(kpi("Avg Delay", f"{ad:.1f}s", f"Adaptive {d_imp:.1f}% lower"), unsafe_allow_html=True)
+                with k3:
+                    st.markdown(kpi("Throughput", f"{at:.1f}", f"Adaptive {t_imp:.1f}% higher"), unsafe_allow_html=True)
+                with k4:
+                    st.markdown(kpi("Samples Used", f"{len(t_vals)}", "from state_log"), unsafe_allow_html=True)
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.plotly_chart(
+                        chart_video_static_compare(
+                            t_vals,
+                            fixed_b["queue"],
+                            adapt_b["queue"],
+                            "Video State — Queue (Fixed vs Adaptive)",
+                            "Queue Length",
+                        ),
+                        use_container_width=True,
+                        config={"displayModeBar": False, "staticPlot": True},
+                    )
+                with c2:
+                    st.plotly_chart(
+                        chart_video_static_compare(
+                            t_vals,
+                            fixed_b["avg_delay"],
+                            adapt_b["avg_delay"],
+                            "Video State — Average Delay (Fixed vs Adaptive)",
+                            "Avg Delay (s)",
+                        ),
+                        use_container_width=True,
+                        config={"displayModeBar": False, "staticPlot": True},
+                    )
+
+                st.plotly_chart(
+                    chart_video_static_compare(
+                        t_vals,
+                        fixed_b["throughput"],
+                        adapt_b["throughput"],
+                        "Video State — Cumulative Throughput (Fixed vs Adaptive)",
+                        "Vehicles Served",
+                    ),
+                    use_container_width=True,
+                    config={"displayModeBar": False, "staticPlot": True},
+                )
+                st.caption(
+                    "Single-intersection benchmark uses video-derived EW arrivals from `state_log` and assumed NS demand scaled from the same video state."
+                )
+
     st.divider()
     st.markdown(
-        "<div style='text-align:center;color:#333;font-size:.75rem'>"
-        "FlowSense — Team HighKey Trophy &nbsp;|&nbsp; India Innovates 2026 &nbsp;|&nbsp;"
-        " Inspired by SURTRAC · SCATS · Singapore TPS"
-        "</div>", unsafe_allow_html=True)
+        "<div style='text-align:center;color:#444;font-size:.75rem'>"
+        "FlowSense Live Simulation — step-based, stochastic, session-state driven"
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # ANIMATION LOOP — advance step and rerun
-    # ──────────────────────────────────────────────────────────────────────────
-    if st.session_state.running:
-        if cur_step >= len(steps) - 1:
-            st.session_state.running = False
-        else:
-            st.session_state.step = cur_step + st.session_state.sim_speed
-            time.sleep(0.07)
-            st.rerun()
+    # Exactly one simulation step per rerun while running.
+    if st.session_state.running and not sim["completed"]:
+        simulation_step(sim)
+        sleep_s = max(0.03, 0.18 / max(1, st.session_state.sim_speed))
+        time.sleep(sleep_s)
+        st.rerun()
 
 
 if __name__ == "__main__":
